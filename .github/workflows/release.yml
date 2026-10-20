@@ -1,0 +1,99 @@
+name: Release
+
+# Publishes a GitHub pre-release from a version tag (e.g. v0.1.0).
+# Stays a PRE-RELEASE until the v0.1 on-machine exit check has passed on
+# Windows 11 Home and Pro - flip prerelease to false after that.
+# Manual runs (workflow_dispatch) exercise the gate + build + packaging
+# only; the publish step runs for tag pushes only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      CODESIGN_PFX: ${{ secrets.CODESIGN_PFX }}
+      CODESIGN_PASSWORD: ${{ secrets.CODESIGN_PASSWORD }}
+      VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}".TrimStart("v")
+          } else {
+            $v = "0.0.0-dev"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Gate
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Build
+        run: cargo build --workspace --release --locked
+
+      - name: Sign the program (optional, skipped without secrets)
+        if: env.CODESIGN_PFX != ''
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\cert.pfx", [Convert]::FromBase64String($env:CODESIGN_PFX))
+          try {
+            & $signtool.FullName sign /f "$env:RUNNER_TEMP\cert.pfx" /p $env:CODESIGN_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /d DriverGuard target/release/driverguard.exe
+            if ($LASTEXITCODE -ne 0) { throw "signing failed" }
+          } finally { Remove-Item "$env:RUNNER_TEMP\cert.pfx" -Force }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ steps.ver.outputs.version }}"
+          New-Item -ItemType Directory dist, dist/portable | Out-Null
+          Copy-Item target/release/driverguard.exe dist/portable/DriverGuard.exe
+          Copy-Item LICENSE dist/portable/LICENSE.txt
+          Copy-Item README.md dist/portable/README.md
+          Compress-Archive -Path dist/portable/* -DestinationPath "dist/DriverGuard-$v-portable.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content dist/SHA256SUMS.txt
+
+      - name: Scan with VirusTotal (optional, skipped without secret)
+        if: env.VIRUSTOTAL_API_KEY != ''
+        shell: pwsh
+        run: |
+          $headers = @{ 'x-apikey' = $env:VIRUSTOTAL_API_KEY }
+          $lines = @('', '### VirusTotal', '', '| File | Report |', '|---|---|')
+          foreach ($f in Get-ChildItem dist -Filter 'DriverGuard-*-portable.zip') {
+            $sha = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines += "| $($f.Name) | [report](https://www.virustotal.com/gui/file/$sha) |"
+          }
+          $lines | Out-File -Append $env:GITHUB_STEP_SUMMARY
+
+      - name: Publish pre-release (tags only)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: DriverGuard ${{ steps.ver.outputs.version }}
+          prerelease: true
+          body: |
+            DriverGuard v${{ steps.ver.outputs.version }} - pre-release.
+            See the release-notes file and README for what v0.1 does, and
+            what is still being verified on real Windows 11 machines.
+          files: |
+            dist/DriverGuard-*-portable.zip
+            dist/SHA256SUMS.txt
