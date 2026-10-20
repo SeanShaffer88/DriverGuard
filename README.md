@@ -80,4 +80,4 @@ cargo test --workspace
 
 ## License
 
-Apache License, Version 2.0. See [LICENSE](LICENSE).
+MIT License. See [LICENSE](LICENSE).
