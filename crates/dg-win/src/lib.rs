@@ -21,9 +21,38 @@ pub enum WinError {
     Api { code: u32, message: String },
     #[error("external tool {tool} failed with exit code {exit_code}")]
     ToolFailed { tool: String, exit_code: i32 },
+    #[error("could not run external tool {tool}: {detail}")]
+    ToolUnavailable { tool: String, detail: String },
+    #[error("backup verification failed: {0}")]
+    Verification(String),
+    #[error("filesystem error at {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Manifest(#[from] dg_core::ManifestError),
+}
+
+impl WinError {
+    pub(crate) fn io(path: &Path, source: std::io::Error) -> Self {
+        WinError::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, WinError>;
+
+/// Current UTC time as an RFC 3339 string, for manifest timestamps.
+pub fn now_iso8601_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    dg_core::iso8601_utc_from_unix(secs)
+}
 
 /// Parse a Windows driver version string (e.g. `"31.0.15.3621"`) into
 /// components. Accepts 1–4 dot-separated numeric components; missing
@@ -312,17 +341,338 @@ pub mod policy {
 /// parsing `pnputil`'s human-readable output, which is localized.
 pub mod backup {
     use super::{Path, Result, WinError};
+    use dg_core::{BackupManifest, BackupPackage};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+
+    /// File name of the manifest inside every backup folder.
+    pub const MANIFEST_FILE: &str = "manifest.json";
+
+    /// One driver package folder found on disk by [`scan_packages`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScannedPackage {
+        /// Folder name (relative to the backup root).
+        pub folder: String,
+        /// The package's INF file name as found in the folder, e.g. `oem42.inf`.
+        pub inf_name: String,
+        pub file_count: u32,
+        pub total_bytes: u64,
+    }
+
+    /// Scan a backup/export folder: one package per immediate subfolder,
+    /// identified by the single `.inf` file at the subfolder's top level.
+    /// Subfolders without a top-level INF are not packages and are ignored.
+    /// A subfolder with several top-level INFs is an error — it is not a
+    /// shape `pnputil /export-driver` produces, and guessing would make
+    /// verification meaningless.
+    pub fn scan_packages(root: &Path) -> Result<Vec<ScannedPackage>> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let entries = std::fs::read_dir(root).map_err(|e| WinError::io(root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| WinError::io(root, e))?;
+            if entry.path().is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+
+        let mut out = Vec::new();
+        for dir in dirs {
+            let files = walk_files(&dir)?;
+            let infs: Vec<String> = files
+                .iter()
+                .filter(|p| p.parent() == Some(dir.as_path()))
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("inf")))
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+            match infs.len() {
+                0 => continue,
+                1 => {}
+                n => {
+                    return Err(WinError::Verification(format!(
+                        "folder {} contains {n} INF files; expected exactly one per driver package",
+                        dir.display()
+                    )));
+                }
+            }
+            let mut total_bytes: u64 = 0;
+            for f in &files {
+                total_bytes += std::fs::metadata(f).map_err(|e| WinError::io(f, e))?.len();
+            }
+            out.push(ScannedPackage {
+                folder: dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                inf_name: infs.into_iter().next().unwrap_or_default(),
+                file_count: files.len() as u32,
+                total_bytes,
+            });
+        }
+        Ok(out)
+    }
+
+    fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(dir).map_err(|e| WinError::io(dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| WinError::io(dir, e))?;
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk_files(&path)?);
+            } else {
+                out.push(path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
 
     /// Export every third-party driver package into `dest`
-    /// (`pnputil /export-driver`). Requires elevation (elevated helper).
-    pub fn export_drivers(_dest: &Path) -> Result<()> {
-        Err(WinError::NotImplemented)
+    /// (`pnputil /export-driver *`), write the manifest, and verify the
+    /// result before returning it. `dest` must be new or empty: each backup
+    /// is its own folder (plan §3.2). Requires elevation.
+    pub fn export_drivers(dest: &Path) -> Result<BackupManifest> {
+        if dest.exists() {
+            let mut entries = std::fs::read_dir(dest).map_err(|e| WinError::io(dest, e))?;
+            if entries.next().is_some() {
+                return Err(WinError::Verification(format!(
+                    "backup destination {} is not empty; each backup needs its own new folder",
+                    dest.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir_all(dest).map_err(|e| WinError::io(dest, e))?;
+        }
+
+        run_pnputil_export(dest)?;
+
+        let scanned = scan_packages(dest)?;
+        if scanned.is_empty() {
+            return Err(WinError::Verification(
+                "pnputil reported success but no driver packages were found in the export folder"
+                    .to_owned(),
+            ));
+        }
+        let manifest = build_manifest(&scanned);
+        let json = manifest.to_json()?;
+        std::fs::write(dest.join(MANIFEST_FILE), json)
+            .map_err(|e| WinError::io(&dest.join(MANIFEST_FILE), e))?;
+        // Self-check: the backup we just made must verify cleanly.
+        verify_backup(dest)?;
+        Ok(manifest)
+    }
+
+    fn run_pnputil_export(dest: &Path) -> Result<()> {
+        let output = std::process::Command::new("pnputil")
+            .arg("/export-driver")
+            .arg("*")
+            .arg(dest)
+            .output()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "pnputil".to_owned(),
+                detail: e.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WinError::ToolFailed {
+                tool: "pnputil".to_owned(),
+                exit_code: output.status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
+    }
+
+    /// Build the manifest for an export: package identity comes from the
+    /// folders on disk; provider, version, and served devices are joined
+    /// from the live inventory by INF name (best effort — a store package
+    /// no present device uses gets an empty provider and version 0.0.0.0,
+    /// visibly, rather than invented data).
+    fn build_manifest(scanned: &[ScannedPackage]) -> BackupManifest {
+        let devices = crate::inventory::snapshot().unwrap_or_default();
+        let mut by_inf: BTreeMap<String, (String, dg_core::DriverVersion, Vec<String>)> =
+            BTreeMap::new();
+        for ds in &devices {
+            if let Some(drv) = &ds.driver {
+                let entry = by_inf
+                    .entry(drv.inf_name.to_lowercase())
+                    .or_insert_with(|| (drv.provider.clone(), drv.version, Vec::new()));
+                entry.2.push(ds.device.name.clone());
+            }
+        }
+        let mut packages: Vec<BackupPackage> = scanned
+            .iter()
+            .map(|sp| {
+                let (provider, version, devs) = by_inf
+                    .get(&sp.inf_name.to_lowercase())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        (
+                            String::new(),
+                            dg_core::DriverVersion(0, 0, 0, 0),
+                            Vec::new(),
+                        )
+                    });
+                BackupPackage {
+                    inf_name: sp.inf_name.clone(),
+                    provider,
+                    version,
+                    devices: devs,
+                }
+            })
+            .collect();
+        packages.sort_by_key(|a| a.inf_name.to_lowercase());
+        BackupManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_utc: crate::now_iso8601_utc(),
+            packages,
+        }
+    }
+
+    /// Verify a backup folder against its `manifest.json`: every manifest
+    /// package must have a folder on disk (identified by its INF file),
+    /// and every package folder on disk must be in the manifest.
+    pub fn verify_backup(dir: &Path) -> Result<BackupManifest> {
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let text =
+            std::fs::read_to_string(&manifest_path).map_err(|e| WinError::io(&manifest_path, e))?;
+        let manifest = BackupManifest::from_json(&text)?;
+        let scanned = scan_packages(dir)?;
+
+        let scanned_infs: BTreeSet<String> =
+            scanned.iter().map(|s| s.inf_name.to_lowercase()).collect();
+        for pkg in &manifest.packages {
+            if !scanned_infs.contains(&pkg.inf_name.to_lowercase()) {
+                return Err(WinError::Verification(format!(
+                    "backup is missing the package folder for {} (provider {})",
+                    pkg.inf_name, pkg.provider
+                )));
+            }
+        }
+        let manifest_infs: BTreeSet<String> = manifest
+            .packages
+            .iter()
+            .map(|p| p.inf_name.to_lowercase())
+            .collect();
+        for sp in &scanned {
+            if !manifest_infs.contains(&sp.inf_name.to_lowercase()) {
+                return Err(WinError::Verification(format!(
+                    "package folder {} ({}) is not listed in the manifest",
+                    sp.folder, sp.inf_name
+                )));
+            }
+        }
+        Ok(manifest)
     }
 
     /// Install driver packages from a backup folder
     /// (`pnputil /add-driver ... /subdirs /install`). Requires elevation.
+    /// Restore lands with the watcher release (plan §3.5).
     pub fn install_drivers(_backup_dir: &Path) -> Result<()> {
         Err(WinError::NotImplemented)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use dg_core::DriverVersion;
+        use std::fs;
+
+        fn temp_dir(tag: &str) -> PathBuf {
+            let dir =
+                std::env::temp_dir().join(format!("driverguard-test-{}-{tag}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn write(path: &Path, bytes: &[u8]) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        /// A synthetic export tree: two packages (one with a nested file),
+        /// one stray folder with no INF.
+        fn fake_export() -> PathBuf {
+            let root = temp_dir("export");
+            write(&root.join("pkg-one").join("oem42.inf"), b"[Version]");
+            write(&root.join("pkg-one").join("driver.sys"), b"sys!");
+            write(&root.join("pkg-two").join("oem7.inf"), b"[Version]");
+            write(&root.join("pkg-two").join("a.dll"), b"dll");
+            write(&root.join("pkg-two").join("sub").join("b.dll"), b"dll2");
+            write(&root.join("notes").join("readme.txt"), b"hello");
+            root
+        }
+
+        fn manifest_for(root: &Path) -> BackupManifest {
+            let scanned = scan_packages(root).unwrap();
+            BackupManifest {
+                app_version: "0.1.0".to_owned(),
+                created_utc: "2026-10-20T00:00:00Z".to_owned(),
+                packages: scanned
+                    .iter()
+                    .map(|sp| BackupPackage {
+                        inf_name: sp.inf_name.clone(),
+                        provider: "Test".to_owned(),
+                        version: DriverVersion(1, 0, 0, 0),
+                        devices: Vec::new(),
+                    })
+                    .collect(),
+            }
+        }
+
+        #[test]
+        fn scan_finds_packages_by_inf() {
+            let root = fake_export();
+            let scanned = scan_packages(&root).unwrap();
+            assert_eq!(scanned.len(), 2);
+            assert_eq!(scanned[0].inf_name, "oem42.inf");
+            assert_eq!(scanned[0].file_count, 2);
+            assert_eq!(scanned[0].total_bytes, 9 + 4);
+            assert_eq!(scanned[1].inf_name, "oem7.inf");
+            assert_eq!(scanned[1].file_count, 3);
+            assert_eq!(scanned[1].total_bytes, 9 + 3 + 4);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn verify_accepts_matching_manifest() {
+            let root = fake_export();
+            let m = manifest_for(&root);
+            fs::write(root.join(MANIFEST_FILE), m.to_json().unwrap()).unwrap();
+            let back = verify_backup(&root).unwrap();
+            assert_eq!(back.packages.len(), 2);
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn verify_rejects_missing_package_folder() {
+            let root = fake_export();
+            let m = manifest_for(&root);
+            fs::write(root.join(MANIFEST_FILE), m.to_json().unwrap()).unwrap();
+            fs::remove_dir_all(root.join("pkg-two")).unwrap();
+            let err = verify_backup(&root).unwrap_err();
+            assert!(err.to_string().contains("oem7.inf"), "got: {err}");
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn verify_rejects_unlisted_package_folder() {
+            let root = fake_export();
+            let m = manifest_for(&root);
+            fs::write(root.join(MANIFEST_FILE), m.to_json().unwrap()).unwrap();
+            write(&root.join("pkg-three").join("oem99.inf"), b"[Version]");
+            assert!(verify_backup(&root).is_err());
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn export_refuses_non_empty_destination() {
+            let root = temp_dir("dest");
+            write(&root.join("existing.txt"), b"x");
+            let err = export_drivers(&root).unwrap_err();
+            assert!(matches!(err, WinError::Verification(_)), "got: {err}");
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 }
 

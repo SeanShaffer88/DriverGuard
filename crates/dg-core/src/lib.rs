@@ -297,6 +297,36 @@ impl BackupManifest {
     }
 }
 
+/// Format a Unix timestamp (seconds since 1970-01-01T00:00:00Z) as an
+/// RFC 3339 UTC string, e.g. `"2026-10-20T00:00:00Z"`. Pure arithmetic —
+/// no clock access and no timezone database.
+pub fn iso8601_utc_from_unix(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let secs_of_day = epoch_secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let (hh, mm, ss) = (
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60,
+    );
+    format!("{year:04}-{month:02}-{day:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Inverse of days-from-civil (Howard Hinnant's algorithm): convert days
+/// since 1970-01-01 into a (year, month, day) Gregorian date.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index, [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -514,5 +544,14 @@ mod tests {
         let json = manifest.to_json().unwrap();
         let back = BackupManifest::from_json(&json).unwrap();
         assert_eq!(manifest, back);
+    }
+
+    #[test]
+    fn iso8601_formatting() {
+        assert_eq!(iso8601_utc_from_unix(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc_from_unix(1), "1970-01-01T00:00:01Z");
+        // Leap day with a mid-day time.
+        assert_eq!(iso8601_utc_from_unix(951_827_696), "2000-02-29T12:34:56Z");
+        assert_eq!(iso8601_utc_from_unix(1_792_454_400), "2026-10-20T00:00:00Z");
     }
 }

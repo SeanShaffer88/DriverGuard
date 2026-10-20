@@ -11,11 +11,16 @@ const USAGE: &str = "\
 Driver Guard — keep the drivers you chose.
 
 USAGE:
-    driverguard              Launch the GUI (not yet implemented)
-    driverguard inventory    Print the device/driver inventory as JSON
-    driverguard --watch      Run one headless driver-change check (planned, v0.3)
-    driverguard --version    Print version
-    driverguard --help       Show this help
+    driverguard                     Launch the GUI (not yet implemented)
+    driverguard inventory           Print the device/driver inventory as JSON
+    driverguard backup <folder>     Back up all third-party driver packages
+                                    into a new folder, with a verified manifest
+                                    (requires an elevated terminal)
+    driverguard verify-backup <folder>
+                                    Verify a backup folder against its manifest
+    driverguard --watch             Run one headless driver-change check (planned, v0.3)
+    driverguard --version           Print version
+    driverguard --help              Show this help
 ";
 
 fn main() -> ExitCode {
@@ -35,6 +40,8 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("inventory") => inventory(),
+        Some("backup") => backup_cmd(&args),
+        Some("verify-backup") => verify_backup_cmd(&args),
         Some("--watch") => {
             eprintln!("--watch is not implemented yet (planned for v0.3).");
             ExitCode::SUCCESS
@@ -63,6 +70,52 @@ fn inventory() -> ExitCode {
         }
         Err(e) => {
             eprintln!("inventory failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn backup_cmd(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(1) else {
+        eprintln!("usage: driverguard backup <folder>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    match dg_win::backup::export_drivers(std::path::Path::new(dir)) {
+        Ok(manifest) => {
+            println!(
+                "Backed up {} driver packages to {dir}:",
+                manifest.packages.len()
+            );
+            for p in &manifest.packages {
+                println!("  {} — {} {}", p.inf_name, p.provider, p.version);
+            }
+            println!("Manifest written and verified.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("backup failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn verify_backup_cmd(args: &[String]) -> ExitCode {
+    let Some(dir) = args.get(1) else {
+        eprintln!("usage: driverguard verify-backup <folder>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    match dg_win::backup::verify_backup(std::path::Path::new(dir)) {
+        Ok(manifest) => {
+            println!(
+                "Backup at {dir} verified: {} packages, created {} (Driver Guard {}).",
+                manifest.packages.len(),
+                manifest.created_utc,
+                manifest.app_version
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("verification failed: {e}");
             ExitCode::FAILURE
         }
     }
