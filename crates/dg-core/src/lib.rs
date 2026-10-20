@@ -1,4 +1,4 @@
-//! Driver Guard core logic.
+//! DriverGuard core logic.
 //!
 //! This crate is pure logic: no Windows FFI and no clock/filesystem I/O.
 //! Everything here is unit-testable on any platform. Platform access lives
@@ -177,7 +177,7 @@ pub fn diff_snapshots(before: &Snapshot, after: &Snapshot) -> Vec<DriverChange> 
 
 /// A read of the Device Installation Restrictions policy, as found.
 ///
-/// This models only what Driver Guard reads and writes. The retroactive
+/// This models only what DriverGuard reads and writes. The retroactive
 /// flag (`DenyDeviceIDsRetroactive`) is intentionally **not** modelled:
 /// this product never sets it, because applying restrictions retroactively
 /// can break devices that are already installed and working. Leaving it out
@@ -233,10 +233,10 @@ pub fn plan_lock(current: &PolicyState, hardware_id: &str) -> LockPlan {
     LockPlan { ops }
 }
 
-/// Plan unlocking one hardware ID that Driver Guard previously locked.
+/// Plan unlocking one hardware ID that DriverGuard previously locked.
 ///
 /// Removes only that ID. The deny list itself is switched off only when it
-/// becomes empty **and** `originally_enabled` is false — i.e. Driver Guard
+/// becomes empty **and** `originally_enabled` is false — i.e. DriverGuard
 /// restores the state it found, and never tears down a deny list that
 /// predates it.
 pub fn plan_unlock(current: &PolicyState, hardware_id: &str, originally_enabled: bool) -> LockPlan {
@@ -271,7 +271,7 @@ pub struct BackupPackage {
 
 /// The `manifest.json` written into every backup folder.
 ///
-/// Backups are plain folders, usable without Driver Guard (e.g. by hand with
+/// Backups are plain folders, usable without DriverGuard (e.g. by hand with
 /// `pnputil /add-driver`); this file is metadata, not a lock-in format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackupManifest {

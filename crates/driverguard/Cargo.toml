@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Driver Guard command-line entry point: GUI, --watch, and --elevated modes."
+description = "DriverGuard command-line entry point: GUI, --watch, and --elevated modes."
 
 [[bin]]
 name = "driverguard"

@@ -1,4 +1,4 @@
-# AGENTS.md — working agreements for Driver Guard
+# AGENTS.md — working agreements for DriverGuard
 
 This file records how work is done in this repository. It applies to human
 and automated contributors alike.

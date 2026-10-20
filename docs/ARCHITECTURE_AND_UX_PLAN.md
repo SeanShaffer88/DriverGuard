@@ -1,13 +1,13 @@
-# Driver Guard — Architecture & UX Plan
+# DriverGuard — Architecture & UX Plan
 
 - **Status:** Draft v1, 2026-10-19 — pre-implementation plan (per project standard: this document precedes code)
-- **Working title:** Driver Guard (name not yet cleared — see §10)
+- **Working title:** DriverGuard (name not yet cleared — see §10)
 - **Platform:** Windows 10 22H2 and Windows 11 · **Language:** Rust · **License (proposed):** Apache-2.0
 - **Problem in one line:** Windows Update silently replaces working, user-chosen drivers with older Microsoft-supplied versions, and the user has no supported, reversible way to prevent it or undo it.
 
 ## 1. Product definition
 
-Driver Guard is a single-purpose, open-source, offline Windows utility that gives the user durable control over their device drivers:
+DriverGuard is a single-purpose, open-source, offline Windows utility that gives the user durable control over their device drivers:
 
 1. **See** — an inventory of every device and the driver it is actually running (provider, version, date), with Microsoft-supplied vs vendor-supplied clearly badged.
 2. **Save** — one-click backup of all third-party driver packages to a plain local folder.
@@ -91,7 +91,7 @@ On every GUI start, live state (inventory + policy) is re-read and reconciled ag
 - Implementation: elevated helper runs `pnputil /export-driver * <backup-folder>`, which exports every third-party package in the Driver Store.
 - **Do not parse `pnputil`'s human output** — it is localized. Instead, verify results by folder diff (new `oem*.inf` package folders) and write the manifest from our own inventory data (INF → provider/version/devices mapping), recording the `pnputil` exit code. Partial failures are reported per package, never silently.
 - Manifest (`manifest.json` in each backup folder): app version, timestamp, per-package `{inf, provider, version, devices[]}`, export result.
-- **Backups are plain folders, usable without Driver Guard** (recoverable by hand with `pnputil /add-driver`). No proprietary container. This is a trust feature and will be stated in the README.
+- **Backups are plain folders, usable without DriverGuard** (recoverable by hand with `pnputil /add-driver`). No proprietary container. This is a trust feature and will be stated in the README.
 
 ### 3.3 Lock (v0.2) — the core mechanism
 
@@ -114,7 +114,7 @@ Semantics to state plainly in docs and UI: Windows Update delivers drivers throu
 - If `DenyDeviceIDs` did not exist before us, unlock deletes the values we created and restores the key to its prior shape.
 - Multiple locked devices share the one policy list; `locks` rows map hardware ID → lock record.
 
-**Unlock everything** removes all Driver Guard entries and restores prior policy values exactly. It is a first-class, tested feature (the panic button), not an afterthought.
+**Unlock everything** removes all DriverGuard entries and restores prior policy values exactly. It is a first-class, tested feature (the panic button), not an afterthought.
 
 ### 3.4 Watch (v0.3)
 
@@ -136,7 +136,7 @@ From a backup, per device, the restore plan (`dg-core`) is:
 
 - **Harm model:** the worst outcome is a user whose working driver becomes unusable, or who cannot install a driver they need. Every design rule in §1.1 and §3.3 exists to make that outcome structurally difficult: retroactive restrictions never set, locks always reversible in-app, restore points before policy changes, unlock-everything as a tested path, Driver Store packages never deleted, driver-signing and Secure Boot settings never touched.
 - **Transactional shape for privileged ops:** capture prior state → apply → verify by re-reading → on any failure, roll back to prior state and show the error with technical details available.
-- **Auditability:** the `events` table is the user-visible History — everything Driver Guard did, and everything Windows did to drivers, timestamped with before/after values. If the tool ever misbehaves, its own log is the first place a user (or a bug report) can look.
+- **Auditability:** the `events` table is the user-visible History — everything DriverGuard did, and everything Windows did to drivers, timestamped with before/after values. If the tool ever misbehaves, its own log is the first place a user (or a bug report) can look.
 
 ## 5. Testing & verification
 
@@ -156,7 +156,7 @@ From a backup, per device, the restore plan (`dg-core`) is:
 ### 6.1 Principles and copy rules
 
 - **Plain English first.** Hardware IDs, registry paths, and INF names live behind a "Technical details" expander in dialogs and History entries — never in primary copy.
-- **Normative honesty sentence** (all lock-related copy derives from this): *"Locking prevents Windows from installing a different driver for this device in most cases. If a driver changes anyway, Driver Guard will tell you and offer to restore yours."*
+- **Normative honesty sentence** (all lock-related copy derives from this): *"Locking prevents Windows from installing a different driver for this device in most cases. If a driver changes anyway, DriverGuard will tell you and offer to restore yours."*
 - **One primary action per view.** Privileged or policy-changing actions confirm with a plain-language consequence statement, and every completed action offers Undo.
 - **No fear copy.** The app never uses "threat", "risk detected", or counts of scary things. It reports facts: what changed, when, and what the user can do about it.
 
@@ -203,7 +203,7 @@ Title: **A driver changed** — Body: *"Graphics — AMD Radeon RX 6600: driver 
 
 ## 10. Open decisions (need Sean)
 
-1. **Name.** "Driver Guard" is a working title. Before the repo is created: check GitHub name availability and obvious trademark collisions. Fallbacks: *DriverKeeper*, *DriverFence*.
+1. **Name.** "DriverGuard" is a working title. Before the repo is created: check GitHub name availability and obvious trademark collisions. Fallbacks: *DriverKeeper*, *DriverFence*.
 2. **License.** Apache-2.0 as recommended in the research brief — confirm.
 3. **Global WU-exclusion toggle timing.** This plan places Lever 2 in v0.2, off by default. Alternative: defer to v1.0 to keep v0.2 purely per-device.
 4. **Watch frequency.** Logon + daily (assumed). Alternative: logon only, for an even quieter tool.

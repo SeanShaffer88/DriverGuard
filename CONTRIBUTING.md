@@ -1,6 +1,6 @@
-# Contributing to Driver Guard
+# Contributing to DriverGuard
 
-Thanks for your interest. Driver Guard is a small project with a deliberate
+Thanks for your interest. DriverGuard is a small project with a deliberate
 working style — please read this before opening a pull request.
 
 ## Before you write code

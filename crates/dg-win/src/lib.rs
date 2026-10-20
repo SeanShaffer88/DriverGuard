@@ -1,4 +1,4 @@
-//! Driver Guard Windows platform layer.
+//! DriverGuard Windows platform layer.
 //!
 //! This is the only crate permitted to contain `unsafe` code (FFI wrappers
 //! over CfgMgr32/SetupAPI and friends), and every `unsafe` block must carry
@@ -32,6 +32,10 @@ pub enum WinError {
     },
     #[error(transparent)]
     Manifest(#[from] dg_core::ManifestError),
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("could not determine the local data directory: {0}")]
+    DataDir(String),
 }
 
 impl WinError {
@@ -679,6 +683,413 @@ pub mod backup {
             let err = export_drivers(&root).unwrap_err();
             assert!(matches!(err, WinError::Verification(_)), "got: {err}");
             let _ = fs::remove_dir_all(&root);
+        }
+    }
+}
+
+/// Local history store: snapshots and backup records in SQLite
+/// (`db.sqlite` in the data directory, plan §2.2/§2.3).
+///
+/// The database is a cache and history — never the source of truth for
+/// anything safety-relevant (policy state lives in the registry and is
+/// re-read, plan §1.1). Losing or deleting the database loses history,
+/// nothing else.
+pub mod store {
+    use super::{Path, Result, WinError};
+    use dg_core::{
+        BackupManifest, Device, DeviceSnapshot, DriverDate, DriverInfo, DriverVersion, Snapshot,
+    };
+    use rusqlite::{params, Connection, OptionalExtension};
+    use std::path::PathBuf;
+
+    const SCHEMA_V1: &str = "\
+CREATE TABLE IF NOT EXISTS snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    taken_at TEXT NOT NULL,
+    origin TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS driver_observations (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    class TEXT NOT NULL,
+    hardware_ids TEXT NOT NULL,
+    provider TEXT,
+    ver0 INTEGER, ver1 INTEGER, ver2 INTEGER, ver3 INTEGER,
+    date_y INTEGER, date_m INTEGER, date_d INTEGER,
+    inf_name TEXT
+);
+CREATE TABLE IF NOT EXISTS backups (
+    folder TEXT PRIMARY KEY,
+    created_utc TEXT NOT NULL,
+    manifest_json TEXT NOT NULL
+);
+PRAGMA user_version = 1;
+";
+
+    /// The application data directory: `%LOCALAPPDATA%\DriverGuard`.
+    pub fn data_dir() -> Result<PathBuf> {
+        let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+            WinError::DataDir("the LOCALAPPDATA environment variable is not set".to_owned())
+        })?;
+        Ok(PathBuf::from(base).join("DriverGuard"))
+    }
+
+    /// An open history store.
+    pub struct Store {
+        conn: Connection,
+    }
+
+    impl Store {
+        /// Open (creating if needed) the store in the default data
+        /// directory.
+        pub fn open_default() -> Result<Store> {
+            let dir = data_dir()?;
+            std::fs::create_dir_all(&dir).map_err(|e| WinError::io(&dir, e))?;
+            Store::open_at(&dir.join("db.sqlite"))
+        }
+
+        /// Open (creating if needed) a store at an explicit path. Used by
+        /// tests; production code uses [`Store::open_default`].
+        pub fn open_at(path: &Path) -> Result<Store> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| WinError::io(parent, e))?;
+            }
+            let conn = Connection::open(path)?;
+            conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            match version {
+                0 => conn.execute_batch(SCHEMA_V1)?,
+                1 => {}
+                other => {
+                    return Err(WinError::DataDir(format!(
+                        "unsupported database schema version {other} (this build understands 1)"
+                    )));
+                }
+            }
+            Ok(Store { conn })
+        }
+
+        /// Record one inventory snapshot with all its device
+        /// observations. Returns the new snapshot's ID.
+        pub fn record_snapshot(
+            &mut self,
+            taken_at: &str,
+            origin: &str,
+            snapshot: &Snapshot,
+        ) -> Result<i64> {
+            let tx = self.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO snapshots (taken_at, origin) VALUES (?1, ?2)",
+                params![taken_at, origin],
+            )?;
+            let id = tx.last_insert_rowid();
+            for ds in &snapshot.devices {
+                let hw_json =
+                    serde_json::to_string(&ds.device.hardware_ids).map_err(|e| WinError::Api {
+                        code: 0,
+                        message: format!("hardware ID serialization failed: {e}"),
+                    })?;
+                let (provider, version, date, inf_name) = match &ds.driver {
+                    Some(d) => (
+                        Some(d.provider.clone()),
+                        Some(d.version),
+                        Some(d.date),
+                        Some(d.inf_name.clone()),
+                    ),
+                    None => (None, None, None, None),
+                };
+                tx.execute(
+                    "INSERT INTO driver_observations (
+                        snapshot_id, instance_id, name, class, hardware_ids,
+                        provider, ver0, ver1, ver2, ver3, date_y, date_m, date_d, inf_name
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                    params![
+                        id,
+                        ds.device.instance_id,
+                        ds.device.name,
+                        ds.device.class,
+                        hw_json,
+                        provider,
+                        version.map(|v| v.0),
+                        version.map(|v| v.1),
+                        version.map(|v| v.2),
+                        version.map(|v| v.3),
+                        date.map(|d| d.year),
+                        date.map(|d| d.month),
+                        date.map(|d| d.day),
+                        inf_name,
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            Ok(id)
+        }
+
+        /// How many snapshots have been recorded.
+        pub fn snapshot_count(&self) -> Result<u32> {
+            let n: i64 = self
+                .conn
+                .query_row("SELECT COUNT(*) FROM snapshots", [], |r| r.get(0))?;
+            Ok(n as u32)
+        }
+
+        /// The most recent snapshot, with the time it was taken.
+        pub fn latest_snapshot(&self) -> Result<Option<(String, Snapshot)>> {
+            let head: Option<(i64, String)> = self
+                .conn
+                .query_row(
+                    "SELECT id, taken_at FROM snapshots ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((id, taken_at)) = head else {
+                return Ok(None);
+            };
+            let mut stmt = self.conn.prepare(
+                "SELECT instance_id, name, class, hardware_ids,
+                        provider, ver0, ver1, ver2, ver3, date_y, date_m, date_d, inf_name
+                 FROM driver_observations WHERE snapshot_id = ?1 ORDER BY rowid",
+            )?;
+            let rows = stmt.query_map(params![id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<u32>>(5)?,
+                    r.get::<_, Option<u32>>(6)?,
+                    r.get::<_, Option<u32>>(7)?,
+                    r.get::<_, Option<u32>>(8)?,
+                    r.get::<_, Option<u32>>(9)?,
+                    r.get::<_, Option<u32>>(10)?,
+                    r.get::<_, Option<u32>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                ))
+            })?;
+            let mut devices = Vec::new();
+            for row in rows {
+                let (
+                    instance_id,
+                    name,
+                    class,
+                    hw_json,
+                    provider,
+                    ver0,
+                    ver1,
+                    ver2,
+                    ver3,
+                    date_y,
+                    date_m,
+                    date_d,
+                    inf_name,
+                ) = row?;
+                // Corrupt JSON in a cache row degrades to "no hardware
+                // IDs recorded" rather than failing the whole read.
+                let hardware_ids: Vec<String> = serde_json::from_str(&hw_json).unwrap_or_default();
+                let driver = match (provider, ver0, date_y, inf_name) {
+                    (Some(p), Some(v0), Some(y), Some(inf)) => Some(DriverInfo {
+                        provider: p,
+                        version: DriverVersion(
+                            v0,
+                            ver1.unwrap_or(0),
+                            ver2.unwrap_or(0),
+                            ver3.unwrap_or(0),
+                        ),
+                        date: DriverDate {
+                            year: y as u16,
+                            month: date_m.unwrap_or(0) as u8,
+                            day: date_d.unwrap_or(0) as u8,
+                        },
+                        inf_name: inf,
+                    }),
+                    _ => None,
+                };
+                devices.push(DeviceSnapshot {
+                    device: Device {
+                        instance_id,
+                        name,
+                        class,
+                        hardware_ids,
+                    },
+                    driver,
+                });
+            }
+            Ok(Some((taken_at, Snapshot { devices })))
+        }
+
+        /// Record a completed backup (re-recording the same folder
+        /// replaces its record).
+        pub fn record_backup(&self, folder: &Path, manifest: &BackupManifest) -> Result<()> {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO backups (folder, created_utc, manifest_json)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    folder.display().to_string(),
+                    manifest.created_utc,
+                    manifest.to_json()?
+                ],
+            )?;
+            Ok(())
+        }
+
+        /// All recorded backups (folder + manifest), newest first.
+        pub fn list_backups(&self) -> Result<Vec<(String, BackupManifest)>> {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT folder, manifest_json FROM backups ORDER BY created_utc DESC")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (folder, json) = row?;
+                out.push((folder, BackupManifest::from_json(&json)?));
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use dg_core::{BackupPackage, Device, DeviceSnapshot, DriverInfo};
+        use std::fs;
+
+        fn temp_dir(tag: &str) -> PathBuf {
+            // Unique per call — parallel tests must not share fixtures
+            // (the backup-test race fixed in PR #2).
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "driverguard-store-test-{}-{tag}-{n}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn sample_snapshot() -> Snapshot {
+            Snapshot {
+                devices: vec![
+                    DeviceSnapshot {
+                        device: Device {
+                            instance_id: "PCI\\VEN_1002&DEV_73FF".to_owned(),
+                            name: "Test GPU".to_owned(),
+                            class: "Display".to_owned(),
+                            hardware_ids: vec![
+                                "PCI\\VEN_1002&DEV_73FF".to_owned(),
+                                "PCI\\VEN_1002".to_owned(),
+                            ],
+                        },
+                        driver: Some(DriverInfo {
+                            provider: "AMD".to_owned(),
+                            version: DriverVersion(31, 0, 15, 3621),
+                            date: DriverDate {
+                                year: 2026,
+                                month: 6,
+                                day: 15,
+                            },
+                            inf_name: "oem42.inf".to_owned(),
+                        }),
+                    },
+                    DeviceSnapshot {
+                        device: Device {
+                            instance_id: "USB\\VID_0000".to_owned(),
+                            name: "Driverless Thing".to_owned(),
+                            class: "USB".to_owned(),
+                            hardware_ids: Vec::new(),
+                        },
+                        driver: None,
+                    },
+                ],
+            }
+        }
+
+        fn sample_manifest() -> BackupManifest {
+            BackupManifest {
+                app_version: "0.1.0".to_owned(),
+                created_utc: "2026-10-20T00:00:00Z".to_owned(),
+                packages: vec![BackupPackage {
+                    inf_name: "oem42.inf".to_owned(),
+                    provider: "AMD".to_owned(),
+                    version: DriverVersion(31, 0, 15, 3621),
+                    devices: vec!["Test GPU".to_owned()],
+                }],
+            }
+        }
+
+        #[test]
+        fn snapshot_round_trips() {
+            let dir = temp_dir("roundtrip");
+            let mut store = Store::open_at(&dir.join("db.sqlite")).unwrap();
+            let snap = sample_snapshot();
+            let id = store
+                .record_snapshot("2026-10-20T00:00:00Z", "test", &snap)
+                .unwrap();
+            assert!(id >= 1);
+            assert_eq!(store.snapshot_count().unwrap(), 1);
+            let (taken_at, back) = store.latest_snapshot().unwrap().unwrap();
+            assert_eq!(taken_at, "2026-10-20T00:00:00Z");
+            assert_eq!(back, snap);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn latest_is_the_most_recent() {
+            let dir = temp_dir("latest");
+            let mut store = Store::open_at(&dir.join("db.sqlite")).unwrap();
+            store
+                .record_snapshot("2026-10-20T00:00:00Z", "test", &sample_snapshot())
+                .unwrap();
+            let mut second = sample_snapshot();
+            second.devices.truncate(1);
+            store
+                .record_snapshot("2026-10-20T01:00:00Z", "test", &second)
+                .unwrap();
+            assert_eq!(store.snapshot_count().unwrap(), 2);
+            let (taken_at, back) = store.latest_snapshot().unwrap().unwrap();
+            assert_eq!(taken_at, "2026-10-20T01:00:00Z");
+            assert_eq!(back.devices.len(), 1);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backups_round_trip_and_replace() {
+            let dir = temp_dir("backups");
+            let store = Store::open_at(&dir.join("db.sqlite")).unwrap();
+            let folder = Path::new("C:\\backups\\2026-10-20");
+            store.record_backup(folder, &sample_manifest()).unwrap();
+            let listed = store.list_backups().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].0, "C:\\backups\\2026-10-20");
+            assert_eq!(listed[0].1, sample_manifest());
+            // Re-recording the same folder replaces, not duplicates.
+            let mut bigger = sample_manifest();
+            bigger.packages.push(BackupPackage {
+                inf_name: "oem7.inf".to_owned(),
+                provider: "Intel".to_owned(),
+                version: DriverVersion(1, 0, 0, 0),
+                devices: Vec::new(),
+            });
+            store.record_backup(folder, &bigger).unwrap();
+            let listed = store.list_backups().unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].1.packages.len(), 2);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn empty_store_reads_as_empty() {
+            let dir = temp_dir("empty");
+            let store = Store::open_at(&dir.join("db.sqlite")).unwrap();
+            assert_eq!(store.snapshot_count().unwrap(), 0);
+            assert!(store.latest_snapshot().unwrap().is_none());
+            assert!(store.list_backups().unwrap().is_empty());
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }

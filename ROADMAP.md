@@ -1,6 +1,6 @@
 # Roadmap
 
-Driver Guard ships in small, CI-gated steps. Exit criteria come from the
+DriverGuard ships in small, CI-gated steps. Exit criteria come from the
 [Architecture & UX Plan](docs/ARCHITECTURE_AND_UX_PLAN.md) §8; a release is
 done when its criteria pass, not when its code merely compiles.
 
