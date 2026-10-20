@@ -2,7 +2,7 @@
 
 - **Status:** v1, 2026-10-19 — approved; in implementation. v0.1 (See & Save) code-complete 2026-10-20; on-machine verification (§8) pending.
 - **Name:** DriverGuard — confirmed final by the maintainer, 2026-10-20 (see §10)
-- **Platform:** Windows 10 22H2 and Windows 11 · **Language:** Rust · **License (proposed):** Apache-2.0
+- **Platform:** Windows 10 22H2 and Windows 11 · **Language:** Rust · **License:** MIT (switched from Apache-2.0 by maintainer decision, 2026-10-20)
 - **Problem in one line:** Windows Update silently replaces working, user-chosen drivers with older Microsoft-supplied versions, and the user has no supported, reversible way to prevent it or undo it.
 
 ## 1. Product definition
@@ -204,6 +204,6 @@ Title: **A driver changed** — Body: *"Graphics — AMD Radeon RX 6600: driver 
 ## 10. Open decisions (need Sean)
 
 1. **Name.** "DriverGuard" is a working title. Before the repo is created: check GitHub name availability and obvious trademark collisions. Fallbacks: *DriverKeeper*, *DriverFence*. — **Decided 2026-10-20: DriverGuard is the final name** (GitHub repo created under it; no formal trademark clearance was performed).
-2. **License.** Apache-2.0 as recommended in the research brief — confirm.
+2. **License.** Apache-2.0 as recommended in the research brief — confirm. — **Decided otherwise 2026-10-20: MIT**, matching the maintainer's other projects.
 3. **Global WU-exclusion toggle timing.** This plan places Lever 2 in v0.2, off by default. Alternative: defer to v1.0 to keep v0.2 purely per-device.
 4. **Watch frequency.** Logon + daily (assumed). Alternative: logon only, for an even quieter tool.
