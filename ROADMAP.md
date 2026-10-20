@@ -11,6 +11,10 @@ done when its criteria pass, not when its code merely compiles.
 - History: local log of everything the app does
 - Exit: backup scenario passes on Windows 11 Home and Pro
 
+*Status: implementation complete (inventory, backup, history, and the
+Drivers window; all CI-gated). The exit scenario still has to run on real
+Windows 11 Home and Pro machines before the v0.1 tag.*
+
 ## v0.2 — Lock
 
 - Per-device locks via Device Installation Restrictions (documented policy)

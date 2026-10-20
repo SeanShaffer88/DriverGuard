@@ -1,7 +1,7 @@
 # DriverGuard — Architecture & UX Plan
 
-- **Status:** Draft v1, 2026-10-19 — pre-implementation plan (per project standard: this document precedes code)
-- **Working title:** DriverGuard (name not yet cleared — see §10)
+- **Status:** v1, 2026-10-19 — approved; in implementation. v0.1 (See & Save) code-complete 2026-10-20; on-machine verification (§8) pending.
+- **Name:** DriverGuard — confirmed final by the maintainer, 2026-10-20 (see §10)
 - **Platform:** Windows 10 22H2 and Windows 11 · **Language:** Rust · **License (proposed):** Apache-2.0
 - **Problem in one line:** Windows Update silently replaces working, user-chosen drivers with older Microsoft-supplied versions, and the user has no supported, reversible way to prevent it or undo it.
 
@@ -65,7 +65,7 @@ Dependency discipline (project standard: small, reputable, stdlib-first): `windo
 
 ### 2.3 Local data
 
-Location: `%LOCALAPPDATA%\DriverGuard\` — `state.db` (SQLite), `backups\<timestamp>\` folders, `logs\`.
+Location: `%LOCALAPPDATA%\DriverGuard\` — `db.sqlite` (SQLite; shipped name — this plan originally said `state.db`, and since the file is a rebuildable cache the shipped name stands), `backups\<timestamp>\` folders, `logs\`.
 
 Core tables:
 
@@ -203,7 +203,7 @@ Title: **A driver changed** — Body: *"Graphics — AMD Radeon RX 6600: driver 
 
 ## 10. Open decisions (need Sean)
 
-1. **Name.** "DriverGuard" is a working title. Before the repo is created: check GitHub name availability and obvious trademark collisions. Fallbacks: *DriverKeeper*, *DriverFence*.
+1. **Name.** "DriverGuard" is a working title. Before the repo is created: check GitHub name availability and obvious trademark collisions. Fallbacks: *DriverKeeper*, *DriverFence*. — **Decided 2026-10-20: DriverGuard is the final name** (GitHub repo created under it; no formal trademark clearance was performed).
 2. **License.** Apache-2.0 as recommended in the research brief — confirm.
 3. **Global WU-exclusion toggle timing.** This plan places Lever 2 in v0.2, off by default. Alternative: defer to v1.0 to keep v0.2 purely per-device.
 4. **Watch frequency.** Logon + daily (assumed). Alternative: logon only, for an even quieter tool.

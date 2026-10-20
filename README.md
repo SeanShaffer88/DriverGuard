@@ -8,9 +8,12 @@ user-chosen driver (GPU drivers are the classic case) with an older
 Microsoft-supplied one — and the built-in recovery paths don't always help.
 DriverGuard exists to make that situation boring.
 
-> **Status: v0.1 skeleton.** This repository currently holds the workspace
-> scaffolding, core data model, and documentation. It is not yet usable.
-> Follow the [roadmap](ROADMAP.md) as it becomes real, release by release.
+> **Status: v0.1 — feature-complete in code, on-machine verification in
+> progress.** Inventory, backup, history, and the Drivers window are
+> implemented and CI-tested on Windows. The v0.1 exit check — the full
+> backup scenario run on real Windows 11 Home and Pro machines — has not
+> been done yet, so treat this as a pre-release: try it, and please
+> report what you find.
 
 ## What it will do
 
@@ -20,6 +23,29 @@ DriverGuard exists to make that situation boring.
 | **Save** | v0.1 | One-click backup of all third-party driver packages to a plain local folder (usable without DriverGuard). |
 | **Lock** | v0.2 | Per-device protection against driver replacement, using documented policy mechanisms — on Home and Pro. Fully reversible, with restore points. |
 | **Watch** | v0.3 | A periodic check that detects driver changes and offers one-click restore from your backup. |
+
+## Using it
+
+**GUI** — run `driverguard.exe` with no arguments. The window lists every
+device and the driver it is actually running, and the status line keeps a
+count of devices using a Microsoft-supplied driver. **Back up all
+drivers** saves every third-party driver package to
+`%LOCALAPPDATA%\DriverGuard\backups\<timestamp>\` and verifies the result
+before reporting success.
+
+**CLI**
+
+```
+driverguard inventory              List devices and drivers as JSON (also records a history snapshot)
+driverguard backup <folder>        Export all third-party drivers to a folder, with manifest, verified
+driverguard verify-backup <folder> Check a backup folder against its manifest
+driverguard history                Show recorded snapshots and backups
+```
+
+**Your data** — everything is local, under `%LOCALAPPDATA%\DriverGuard\`:
+the history database (`db.sqlite`) and the `backups\` folders. A backup is
+a plain folder of driver packages with a JSON manifest — usable without
+DriverGuard. Nothing is ever sent anywhere.
 
 ## Design principles
 
