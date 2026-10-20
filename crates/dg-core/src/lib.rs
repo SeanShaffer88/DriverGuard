@@ -97,10 +97,13 @@ pub struct Device {
 }
 
 /// One device and the driver bound to it at snapshot time.
+///
+/// `driver` is `None` when no bound driver could be determined (devices
+/// without a driver are real and must still appear in the inventory).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSnapshot {
     pub device: Device,
-    pub driver: DriverInfo,
+    pub driver: Option<DriverInfo>,
 }
 
 /// A point-in-time inventory of every device that could be read.
@@ -142,14 +145,14 @@ pub fn diff_snapshots(before: &Snapshot, after: &Snapshot) -> Vec<DriverChange> 
                 instance_id: (*id).to_owned(),
                 device_name: after_dev.device.name.clone(),
                 before: None,
-                after: Some(after_dev.driver.clone()),
+                after: after_dev.driver.clone(),
             }),
             Some(before_dev) if before_dev.driver != after_dev.driver => {
                 changes.push(DriverChange {
                     instance_id: (*id).to_owned(),
                     device_name: after_dev.device.name.clone(),
-                    before: Some(before_dev.driver.clone()),
-                    after: Some(after_dev.driver.clone()),
+                    before: before_dev.driver.clone(),
+                    after: after_dev.driver.clone(),
                 });
             }
             _ => {}
@@ -160,7 +163,7 @@ pub fn diff_snapshots(before: &Snapshot, after: &Snapshot) -> Vec<DriverChange> 
             changes.push(DriverChange {
                 instance_id: (*id).to_owned(),
                 device_name: before_dev.device.name.clone(),
-                before: Some(before_dev.driver.clone()),
+                before: before_dev.driver.clone(),
                 after: None,
             });
         }
@@ -323,7 +326,7 @@ mod tests {
                 class: "Display".to_owned(),
                 hardware_ids: vec!["PCI\\VEN_1002&DEV_73FF".to_owned()],
             },
-            driver: drv,
+            driver: Some(drv),
         }
     }
 
@@ -395,6 +398,35 @@ mod tests {
         };
         let changes = diff_snapshots(&before, &after);
         assert_eq!(changes.len(), 2);
+    }
+
+    #[test]
+    fn diff_detects_driver_appearing_and_disappearing() {
+        let no_driver = Snapshot {
+            devices: vec![DeviceSnapshot {
+                device: Device {
+                    instance_id: "A".to_owned(),
+                    name: "Device A".to_owned(),
+                    class: "Display".to_owned(),
+                    hardware_ids: Vec::new(),
+                },
+                driver: None,
+            }],
+        };
+        let with_driver = Snapshot {
+            devices: vec![device_snapshot(
+                "A",
+                driver("AMD", DriverVersion(1, 0, 0, 0)),
+            )],
+        };
+        let appeared = diff_snapshots(&no_driver, &with_driver);
+        assert_eq!(appeared.len(), 1);
+        assert!(appeared[0].before.is_none());
+        assert!(appeared[0].after.is_some());
+        let disappeared = diff_snapshots(&with_driver, &no_driver);
+        assert_eq!(disappeared.len(), 1);
+        assert!(disappeared[0].before.is_some());
+        assert!(disappeared[0].after.is_none());
     }
 
     #[test]
