@@ -5,10 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Driver Guard Windows platform layer: CfgMgr32/SetupAPI, pnputil, policy, restore points, toasts. The only crate allowed unsafe code."
+description = "DriverGuard Windows platform layer: CfgMgr32/SetupAPI, pnputil, policy, restore points, toasts. The only crate allowed unsafe code."
 
 [dependencies]
 dg-core = { path = "../dg-core", version = "0.1.0" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]

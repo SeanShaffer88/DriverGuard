@@ -1,12 +1,12 @@
-# Driver Guard
+# DriverGuard
 
 **Your drivers, your choice — enforced.**
 
-Driver Guard is a small, open-source, offline Windows utility that gives you durable
+DriverGuard is a small, open-source, offline Windows utility that gives you durable
 control over your device drivers. Windows Update sometimes replaces a working,
 user-chosen driver (GPU drivers are the classic case) with an older
 Microsoft-supplied one — and the built-in recovery paths don't always help.
-Driver Guard exists to make that situation boring.
+DriverGuard exists to make that situation boring.
 
 > **Status: v0.1 skeleton.** This repository currently holds the workspace
 > scaffolding, core data model, and documentation. It is not yet usable.
@@ -17,7 +17,7 @@ Driver Guard exists to make that situation boring.
 | Verb | Release | Meaning |
 | ---- | ------- | ------- |
 | **See** | v0.1 | Inventory of every device and the driver it is actually running — provider, version, date — badged as vendor-supplied or Microsoft-supplied. |
-| **Save** | v0.1 | One-click backup of all third-party driver packages to a plain local folder (usable without Driver Guard). |
+| **Save** | v0.1 | One-click backup of all third-party driver packages to a plain local folder (usable without DriverGuard). |
 | **Lock** | v0.2 | Per-device protection against driver replacement, using documented policy mechanisms — on Home and Pro. Fully reversible, with restore points. |
 | **Watch** | v0.3 | A periodic check that detects driver changes and offers one-click restore from your backup. |
 

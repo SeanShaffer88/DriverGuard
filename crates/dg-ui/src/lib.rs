@@ -1,4 +1,4 @@
-//! Driver Guard user interface (native Win32).
+//! DriverGuard user interface (native Win32).
 //!
 //! Skeleton: the UI lands after `dg-core` and `dg-win` inventory works end
 //! to end. The layout, views, and copy rules are specified in
