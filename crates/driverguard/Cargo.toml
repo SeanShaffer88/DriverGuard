@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 dg-core = { path = "../dg-core", version = "0.1.0" }
 dg-win = { path = "../dg-win", version = "0.1.0" }
+serde_json = { workspace = true }
