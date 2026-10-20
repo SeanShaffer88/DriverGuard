@@ -49,6 +49,8 @@ impl WinError {
 
 pub type Result<T> = std::result::Result<T, WinError>;
 
+pub mod gui;
+
 /// Current UTC time as an RFC 3339 string, for manifest timestamps.
 pub fn now_iso8601_utc() -> String {
     let secs = std::time::SystemTime::now()

@@ -27,11 +27,14 @@ USAGE:
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => {
-            println!("The DriverGuard GUI is not implemented yet (v0.1 in development).\n");
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        None => match dg_ui::run_gui() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("GUI failed to start: {e}\n");
+                print!("{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
         Some("--help" | "-h") => {
             print!("{USAGE}");
             ExitCode::SUCCESS

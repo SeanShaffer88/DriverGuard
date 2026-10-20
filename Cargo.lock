@@ -30,6 +30,10 @@ dependencies = [
 [[package]]
 name = "dg-ui"
 version = "0.1.0"
+dependencies = [
+ "dg-core",
+ "dg-win",
+]
 
 [[package]]
 name = "dg-win"
@@ -47,6 +51,7 @@ name = "driverguard"
 version = "0.1.0"
 dependencies = [
  "dg-core",
+ "dg-ui",
  "dg-win",
  "serde_json",
 ]
