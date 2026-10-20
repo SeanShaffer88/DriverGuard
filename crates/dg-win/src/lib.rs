@@ -578,8 +578,15 @@ pub mod backup {
         use std::fs;
 
         fn temp_dir(tag: &str) -> PathBuf {
-            let dir =
-                std::env::temp_dir().join(format!("driverguard-test-{}-{tag}", std::process::id()));
+            // Unique per call: tests run in parallel threads in one
+            // process, so sharing a directory per tag makes them race
+            // (delete/recreate each other's fixtures) — this failed
+            // intermittently when run repeatedly, and on Windows CI.
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("driverguard-test-{}-{tag}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             dir
