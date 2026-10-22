@@ -3,7 +3,7 @@
 //! Modes (plan §2.1): GUI by default, `inventory` for a JSON inventory of
 //! devices and their bound drivers, `--watch` for the headless scheduled
 //! check, and `--elevated <op>` for the UAC helper. The GUI, watcher, and
-//! elevated helper are not implemented yet; each reports that honestly.
+//! elevated helper have separate implementation status; see --help.
 
 use std::process::ExitCode;
 
@@ -11,7 +11,7 @@ const USAGE: &str = "\
 DriverGuard — keep the drivers you chose.
 
 USAGE:
-    driverguard                     Launch the GUI (not yet implemented)
+    driverguard                     Launch the Devices window
     driverguard inventory           Print the device/driver inventory as JSON
     driverguard backup <folder>     Back up all third-party driver packages
                                     into a new folder, with a verified manifest
