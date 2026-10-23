@@ -4,8 +4,8 @@
 //! over CfgMgr32/SetupAPI and friends), and every `unsafe` block must carry
 //! a comment stating the invariants it relies on.
 //!
-//! Module status: `inventory` is implemented (plan §3.1); `policy`,
-//! `backup`, and `system` are documented stubs returning
+//! Module status: `inventory`, `backup`, `store`, `gui`, and `elevate`
+//! are implemented; `policy` and `system` are documented stubs returning
 //! [`WinError::NotImplemented`] until their releases land (plan §8).
 
 // NOTE: `#![forbid(unsafe_code)]` is intentionally not set here — this crate
@@ -36,6 +36,8 @@ pub enum WinError {
     Db(#[from] rusqlite::Error),
     #[error("could not determine the local data directory: {0}")]
     DataDir(String),
+    #[error("administrator approval was declined, so the operation did not run")]
+    ElevationDeclined,
 }
 
 impl WinError {
@@ -49,6 +51,7 @@ impl WinError {
 
 pub type Result<T> = std::result::Result<T, WinError>;
 
+pub mod elevate;
 pub mod gui;
 
 /// Current UTC time as an RFC 3339 string, for manifest timestamps.
@@ -434,11 +437,11 @@ pub mod backup {
         Ok(out)
     }
 
-    /// Export every third-party driver package into `dest`
-    /// (`pnputil /export-driver *`), write the manifest, and verify the
-    /// result before returning it. `dest` must be new or empty: each backup
-    /// is its own folder (plan §3.2). Requires elevation.
-    pub fn export_drivers(dest: &Path) -> Result<BackupManifest> {
+    /// The part of the destination contract that needs no writes and no
+    /// elevation: an existing destination must be empty (plan §3.2).
+    /// Checked up front by [`export_drivers_elevated`] so a doomed
+    /// backup fails before any UAC prompt appears.
+    fn validate_dest(dest: &Path) -> Result<()> {
         if dest.exists() {
             let mut entries = std::fs::read_dir(dest).map_err(|e| WinError::io(dest, e))?;
             if entries.next().is_some() {
@@ -447,7 +450,31 @@ pub mod backup {
                     dest.display()
                 )));
             }
-        } else {
+        }
+        Ok(())
+    }
+
+    /// Export drivers into `dest`, going through the elevated helper
+    /// (plan §2.1) when this process is not already elevated: the user
+    /// gets one UAC prompt, the helper performs the export, and the
+    /// result is loaded back through the same [`verify_backup`] every
+    /// backup must pass.
+    pub fn export_drivers_elevated(dest: &Path) -> Result<BackupManifest> {
+        validate_dest(dest)?;
+        if crate::elevate::is_elevated()? {
+            return export_drivers(dest);
+        }
+        crate::elevate::run_export_helper(dest)?;
+        verify_backup(dest)
+    }
+
+    /// Export every third-party driver package into `dest`
+    /// (`pnputil /export-driver *`), write the manifest, and verify the
+    /// result before returning it. `dest` must be new or empty: each backup
+    /// is its own folder (plan §3.2). Requires elevation.
+    pub fn export_drivers(dest: &Path) -> Result<BackupManifest> {
+        validate_dest(dest)?;
+        if !dest.exists() {
             std::fs::create_dir_all(dest).map_err(|e| WinError::io(dest, e))?;
         }
 

@@ -65,7 +65,9 @@ impl App {
                 }
                 self.backup_running = true;
                 gui.set_backup_enabled(false);
-                gui.set_status("Backing up all drivers… this can take a minute.");
+                gui.set_status(
+                    "Backing up all drivers… Windows may ask for administrator approval.",
+                );
                 spawn_backup(gui.handle());
             }
             GuiEvent::Worker(Msg::InventoryLoaded(Ok(devices))) => {
@@ -171,7 +173,7 @@ fn run_backup() -> Result<BackupDone, String> {
         .join("backups");
     let stamp = dg_win::now_iso8601_utc().replace(':', "-");
     let dest = base.join(stamp.trim_end_matches('Z'));
-    let manifest = dg_win::backup::export_drivers(&dest).map_err(|e| e.to_string())?;
+    let manifest = dg_win::backup::export_drivers_elevated(&dest).map_err(|e| e.to_string())?;
     if let Ok(store) = dg_win::store::Store::open_default() {
         let _ = store.record_backup(&dest, &manifest);
     }

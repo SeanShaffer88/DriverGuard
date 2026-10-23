@@ -54,6 +54,8 @@ A single signed executable, `driverguard.exe`, with three modes:
 
 *Why no service:* every state change in this product is either user-initiated or periodic. A service would add attack surface, signing/AV scrutiny, and permanent maintenance for zero user benefit. Phasing: v0.1 needs only the `export-drivers` op; the broker hardens in v0.2 when policy writes land.
 
+*Implementation status (2026-10-23):* the `export-drivers` op shipped in its basic form — a strict argv allowlist (one operation, one absolute folder argument, validated before anything runs) and an exit-code result contract; the parent process loads the finished backup back through the standard verification and records history itself, so the helper never touches the user's database. The one-shot JSON channel replaces the argv form when the broker hardens in v0.2, as phased above.
+
 ### 2.2 Crate layout (single Cargo workspace)
 
 - **`dg-core`** — pure logic, no FFI: device/driver data model, four-part driver-version comparison, the diff engine, the lock-plan builder, backup manifest read/write. Fully unit-testable on any OS.
