@@ -31,7 +31,10 @@ device and the driver it is actually running, and the status line keeps a
 count of devices using a Microsoft-supplied driver. **Back up all
 drivers** saves every third-party driver package to
 `%LOCALAPPDATA%\DriverGuard\backups\<timestamp>\` and verifies the result
-before reporting success.
+before reporting success. Exporting drivers is one of the few things
+Windows reserves for administrators, so Windows asks for approval at
+that moment: the DriverGuard window itself stays unprivileged, and a
+small elevated helper performs just the export and exits.
 
 **CLI**
 
@@ -41,6 +44,9 @@ driverguard backup <folder>        Export all third-party drivers to a folder, w
 driverguard verify-backup <folder> Check a backup folder against its manifest
 driverguard history                Show recorded snapshots and backups
 ```
+
+The `backup` command asks for administrator approval the same way the
+window does, unless the terminal is already elevated.
 
 **Your data** — everything is local, under `%LOCALAPPDATA%\DriverGuard\`:
 the history database (`db.sqlite`) and the `backups\` folders. A backup is

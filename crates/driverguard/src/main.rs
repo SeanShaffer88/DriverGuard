@@ -15,7 +15,7 @@ USAGE:
     driverguard inventory           Print the device/driver inventory as JSON
     driverguard backup <folder>     Back up all third-party driver packages
                                     into a new folder, with a verified manifest
-                                    (requires an elevated terminal)
+                                    (asks for administrator approval when needed)
     driverguard verify-backup <folder>
                                     Verify a backup folder against its manifest
     driverguard history             Show recorded snapshots and backups
@@ -43,6 +43,7 @@ fn main() -> ExitCode {
             println!("driverguard {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("--elevated") => ExitCode::from(dg_win::elevate::helper_main(&args[1..])),
         Some("inventory") => inventory(),
         Some("backup") => backup_cmd(&args),
         Some("verify-backup") => verify_backup_cmd(&args),
@@ -112,7 +113,7 @@ fn backup_cmd(args: &[String]) -> ExitCode {
         eprintln!("usage: driverguard backup <folder>\n\n{USAGE}");
         return ExitCode::FAILURE;
     };
-    match dg_win::backup::export_drivers(std::path::Path::new(dir)) {
+    match dg_win::backup::export_drivers_elevated(std::path::Path::new(dir)) {
         Ok(manifest) => {
             println!(
                 "Backed up {} driver packages to {dir}:",
