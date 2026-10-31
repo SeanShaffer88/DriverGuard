@@ -690,7 +690,8 @@ mod tests {
 
     #[test]
     fn row_for_vendor_driver() {
-        let row = row_for(&device(Some(driver("AMD"))));
+        let locks = HashSet::new();
+        let row = row_for(&device(Some(driver("AMD"))), &locks);
         assert_eq!(
             row,
             vec![
@@ -699,21 +700,32 @@ mod tests {
                 "AMD",
                 "31.0.15.3621",
                 "2026-06-15",
-                "From vendor"
+                "Vendor",
+                ""
             ]
         );
     }
 
     #[test]
     fn row_for_microsoft_driver() {
-        let row = row_for(&device(Some(driver("Microsoft"))));
-        assert_eq!(row[5], "From Microsoft");
+        let locks = HashSet::new();
+        let row = row_for(&device(Some(driver("Microsoft"))), &locks);
+        assert_eq!(row[5], "Microsoft");
     }
 
     #[test]
     fn row_for_driverless_device() {
-        let row = row_for(&device(None));
-        assert_eq!(row, vec!["Test GPU", "Display", "—", "—", "—", "No driver"]);
+        let locks = HashSet::new();
+        let row = row_for(&device(None), &locks);
+        assert_eq!(row, vec!["Test GPU", "Display", "—", "—", "—", "No driver", ""]);
+    }
+
+    #[test]
+    fn row_for_locked_device() {
+        let mut locks = HashSet::new();
+        locks.insert("pci\\test".to_owned());
+        let row = row_for(&device(Some(driver("AMD"))), &locks);
+        assert_eq!(row[6], "Locked");
     }
 
     #[test]
