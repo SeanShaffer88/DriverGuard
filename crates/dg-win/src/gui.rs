@@ -41,6 +41,8 @@ pub enum GuiEvent<M> {
     ViewSelected(usize),
     /// The action button was clicked.
     BackupClicked,
+    /// The secondary (right-of-action) button was clicked.
+    SecondaryClicked,
     /// The user activated (double-clicked / Enter) a list row. Index is
     /// the 0-based row index in the current view.
     RowActivated(usize),
@@ -57,6 +59,7 @@ struct Handles {
     nav: isize,
     list: isize,
     button: isize,
+    secondary: isize,
     status: isize,
 }
 
@@ -88,11 +91,20 @@ impl<M> Gui<M> {
     /// Enable or disable the action button (e.g. while a backup runs).
     pub fn set_backup_enabled(&self, enabled: bool) {
         unsafe_set_enabled(self.handles.button, enabled);
+        unsafe_set_enabled(self.handles.secondary, enabled);
     }
 
     /// Change the action-button label (per-view primary action, §6.2).
     pub fn set_backup_label(&self, text: &str) {
         unsafe_set_text(self.handles.button, text);
+    }
+
+    /// Change the secondary (right-of-primary) button label and toggle
+    /// its visibility. Pass an empty string to hide it. Secondary
+    /// button clicks arrive as [`GuiEvent::SecondaryClicked`].
+    pub fn set_secondary(&self, text: &str) {
+        unsafe_set_text(self.handles.secondary, text);
+        unsafe_set_visible(self.handles.secondary, !text.is_empty());
     }
 
     /// Replace the list-view columns and clear its contents.
@@ -160,6 +172,52 @@ pub fn open_folder_in_shell(path: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Modal-result code from [`show_message`]. Returned as a plain integer
+/// so `dg-ui` can compare without importing Win32 types: the values match
+/// Win32 IDOK/IDCANCEL/IDYES/IDNO (1/2/6/7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgResult {
+    Ok = 1,
+    Cancel = 2,
+    Yes = 6,
+    No = 7,
+}
+
+/// Buttons shown by [`show_message`]; mirrors the four MB_* flag sets we
+/// need (OK, OKCancel, YesNo, YesNoCancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgButtons {
+    Ok,
+    OkCancel,
+    YesNo,
+}
+
+/// Which icon to show next to the message (mirrors the MB_ICON* flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgIcon {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+/// Show a modal message box on the current thread's desktop. Safe
+/// wrapper around `MessageBoxW` for the small set of dialogs the UI
+/// needs (confirmations, completion notices, error reporting). On
+/// non-Windows platforms this is a no-op that returns Ok with the
+/// cancel-equivalent, so callers default to the safe path.
+pub fn show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIcon) -> MsgResult {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe_show_message(title, text, buttons, icon)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, text, buttons, icon);
+        MsgResult::Cancel
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Windows implementation (all unsafe lives here).
 // ---------------------------------------------------------------------------
@@ -193,6 +251,19 @@ fn unsafe_set_enabled(addr: isize, enabled: bool) {
 
 #[cfg(not(target_os = "windows"))]
 fn unsafe_set_enabled(_addr: isize, _enabled: bool) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_set_visible(addr: isize, visible: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW, HWND};
+    use std::ffi::c_void;
+    // Invariant: addr is our button control.
+    unsafe {
+        let _ = ShowWindow(HWND(addr as *mut c_void), if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_set_visible(_addr: isize, _visible: bool) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_rows(list_addr: isize, columns: usize, rows: &[Vec<String>]) {
@@ -320,6 +391,50 @@ fn unsafe_open_folder(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
+fn unsafe_open_folder(_path: &std::path::Path) -> Result<()> {
+    Err(crate::WinError::NotImplemented)
+}
+
+#[cfg(target_os = "windows")]
+fn unsafe_show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIcon) -> MsgResult {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+        MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT,
+    };
+    let flags = match buttons {
+        MsgButtons::Ok => MB_OK,
+        MsgButtons::OkCancel => MB_OKCANCEL,
+        MsgButtons::YesNo => MB_YESNO,
+    } | match icon {
+        MsgIcon::Info => MB_ICONINFORMATION,
+        MsgIcon::Warning => MB_ICONWARNING,
+        MsgIcon::Error => MB_ICONERROR,
+        MsgIcon::Question => MB_ICONQUESTION,
+    };
+    let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let m: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::core::PCWSTR;
+    // SAFETY: MessageBoxW with a null HWND owner shows a task-modal
+    // dialog on the current desktop; our wide strings are valid for
+    // the duration of the synchronous call. No input state is mutated.
+    let res: MESSAGEBOX_RESULT = unsafe {
+        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), flags)
+    };
+    match res.0 as i32 {
+        1 => MsgResult::Ok,
+        2 => MsgResult::Cancel,
+        6 => MsgResult::Yes,
+        7 => MsgResult::No,
+        _ => MsgResult::Cancel,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_show_message(_title: &str, _text: &str, _buttons: MsgButtons, _icon: MsgIcon) -> MsgResult {
+    MsgResult::Cancel
+}
+
 #[cfg(target_os = "windows")]
 fn win_run<M, F>(spec: WindowSpec, handler: F) -> Result<()>
 where
@@ -352,6 +467,7 @@ where
 
     const WM_WORKER: u32 = 0x8001;
     const ID_BACKUP: usize = 1001;
+    const ID_SECONDARY: usize = 1004;
     const ID_NAV: usize = 1002;
     const ID_LIST: usize = 1003;
     const NAV_WIDTH: i32 = 160;
@@ -359,6 +475,7 @@ where
     const BUTTON_H: i32 = 32;
     const STATUS_H: i32 = 20;
     const BUTTON_W: i32 = 200;
+    const BUTTON_GAP: i32 = 8;
 
     type Handler<M> = Box<dyn FnMut(GuiEvent<M>, &Gui<M>) + 'static>;
 
@@ -416,11 +533,22 @@ where
                 (height - 2 * GUTTER).max(0),
                 true,
             );
+            let primary_w = BUTTON_W.min(content_w);
             let _ = MoveWindow(
                 hwnd(h.button),
                 content_x,
                 GUTTER,
-                BUTTON_W.min(content_w),
+                primary_w,
+                BUTTON_H,
+                true,
+            );
+            let sec_x = content_x + primary_w + BUTTON_GAP;
+            let sec_w = (content_w - primary_w - BUTTON_GAP).max(0).min(BUTTON_W);
+            let _ = MoveWindow(
+                hwnd(h.secondary),
+                sec_x,
+                GUTTER,
+                sec_w,
                 BUTTON_H,
                 true,
             );
@@ -485,6 +613,8 @@ where
                 let notify = (wparam.0 >> 16) & 0xFFFF;
                 if id == ID_BACKUP && notify == 0 {
                     fire(state, GuiEvent::BackupClicked);
+                } else if id == ID_SECONDARY && notify == 0 {
+                    fire(state, GuiEvent::SecondaryClicked);
                 } else if id == ID_NAV && notify as u32 == LBN_SELCHANGE as u32 {
                     let lres = unsafe {
                         SendMessageW(
@@ -623,6 +753,27 @@ where
             .unwrap_or_default();
             state.handles.button = button.0 as isize;
 
+            // Secondary button: hidden by default, shown per-view via
+            // Gui::set_secondary (e.g. Settings uses it for a second
+            // action like toggling the watch task).
+            let empty_label = wide("");
+            let secondary = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                PCWSTR(empty_label.as_ptr()),
+                WS_CHILD | WINDOW_STYLE(BS_PUSHBUTTON as u32), // starts hidden
+                NAV_WIDTH + GUTTER + BUTTON_W + BUTTON_GAP,
+                GUTTER,
+                BUTTON_W,
+                BUTTON_H,
+                Some(parent),
+                Some(HMENU(ID_SECONDARY as *mut c_void)),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            state.handles.secondary = secondary.0 as isize;
+
             let list = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 WC_LISTVIEWW,
@@ -685,7 +836,7 @@ where
             .unwrap_or_default();
             state.handles.status = status.0 as isize;
 
-            for child in [nav, button, list, status] {
+            for child in [nav, button, secondary, list, status] {
                 SendMessageW(
                     child,
                     WM_SETFONT,

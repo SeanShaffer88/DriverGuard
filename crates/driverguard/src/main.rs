@@ -488,9 +488,9 @@ fn watch_cmd() -> ExitCode {
         Err(e) => {
             let _ = store.record_event(
                 dg_core::EventKind::RestoreFailedDriver,
+                &dg_win::now_iso8601_utc(),
                 "watch: could not enumerate devices",
-                &e.to_string(),
-                None,
+                Some(&e.to_string()),
             );
             return ExitCode::SUCCESS;
         }
@@ -538,8 +538,8 @@ fn watch_cmd() -> ExitCode {
             .unwrap_or_default();
     let _ = store.record_event(
         dg_core::EventKind::DriverChanged,
+        &dg_win::now_iso8601_utc(),
         &summary,
-        "",
         Some(&detail_json),
     );
     let _ = dg_win::system::notify_driver_changed(&summary);

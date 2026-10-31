@@ -698,6 +698,7 @@ pub mod policy {
             if touches_restrictions {
                 let r_w = wide(RESTRICTIONS_KEY);
                 let h = create_key(PCWSTR(r_w.as_ptr()))?;
+                let _h_guard = Key(Some(h));
                 let lifted_enabled = !installs.is_empty() || final_deny_enabled;
                 // During lift we keep the flag enabled if the final
                 // state keeps it on (foreign entries remain), otherwise

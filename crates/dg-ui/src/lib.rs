@@ -8,9 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use dg_core::{DeviceSnapshot, DriverSource, Snapshot};
+use dg_core::{DeviceSnapshot, DriverSource, LockRecord, Snapshot};
 use dg_win::backup::MANIFEST_FILE;
-use dg_win::gui::{Gui, GuiEvent, GuiHandle, WindowSpec};
+use dg_win::gui::{Gui, GuiEvent, GuiHandle, MsgButtons, MsgIcon, MsgResult, WindowSpec};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 /// The four top-level views, in navigation order (plan §6.2).
@@ -41,12 +42,13 @@ impl View {
 fn columns_for(view: View) -> Vec<(String, i32)> {
     match view {
         View::Devices => vec![
-            ("Device".to_owned(), 240),
-            ("Class".to_owned(), 90),
-            ("Provider".to_owned(), 150),
-            ("Version".to_owned(), 110),
-            ("Date".to_owned(), 95),
-            ("Status".to_owned(), 140),
+            ("Device".to_owned(), 220),
+            ("Class".to_owned(), 80),
+            ("Provider".to_owned(), 120),
+            ("Version".to_owned(), 100),
+            ("Date".to_owned(), 85),
+            ("Source".to_owned(), 90),
+            ("Lock".to_owned(), 90),
         ],
         View::Backups => vec![
             ("Created (UTC)".to_owned(), 160),
@@ -82,6 +84,12 @@ enum Msg {
     BackupFinished(Result<BackupDone, String>),
     BackupsLoaded(Result<Vec<(String, dg_core::BackupManifest)>, String>),
     HistoryLoaded(Result<Vec<dg_core::Event>, String>),
+    /// A lock or unlock action completed on the worker thread; bool is
+    /// true for locked, false for unlocked. String is a human-readable
+    /// status message for the status line.
+    LockFinished { locked: bool, message: String },
+    /// The watch-task toggle completed; bool is true for registered.
+    WatchToggled { registered: bool, message: String },
 }
 
 /// A completed backup, as reported to the status line.
@@ -90,13 +98,24 @@ struct BackupDone {
     packages: usize,
 }
 
+/// Which Settings secondary action is currently visible, so a click on
+/// the secondary button can be dispatched. The button is hidden in
+/// views that don't need a second action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryAction {
+    None,
+    ToggleWatch,
+}
+
 /// Window state (UI thread only).
 #[derive(Default)]
 struct App {
     view: View,
     backup_running: bool,
+    secondary: SecondaryAction,
     /// Last loaded inventory, used to refresh the Devices view header
     /// and to build Settings/About summaries.
+    last_devices: Option<Vec<DeviceSnapshot>>,
     last_device_count: Option<usize>,
     last_microsoft_count: Option<usize>,
 }
@@ -122,6 +141,8 @@ impl App {
         gui.set_columns(&columns_for(view));
         gui.set_backup_label(action_label(view));
         gui.set_backup_enabled(!self.backup_running || view != View::Devices);
+        self.secondary = SecondaryAction::None;
+        gui.set_secondary("");
         match view {
             View::Devices => {
                 if self.last_device_count.is_none() {
@@ -154,7 +175,7 @@ impl App {
         }
     }
 
-    fn render_settings(&self, gui: &Gui<Msg>) {
+    fn render_settings(&mut self, gui: &Gui<Msg>) {
         let mut rows: Vec<Vec<String>> = Vec::new();
         rows.push(vec![
             "Version".to_owned(),
@@ -201,6 +222,12 @@ impl App {
             "DriverGuard makes no network calls.".to_owned(),
         ]);
         gui.set_rows(&rows);
+        self.secondary = SecondaryAction::ToggleWatch;
+        gui.set_secondary(if watch_on {
+            "Unregister watch task"
+        } else {
+            "Register watch task"
+        });
         gui.set_status(&format!("Settings. {}", self.device_summary()));
     }
 
@@ -217,6 +244,13 @@ impl App {
                     self.switch_view(new_view, gui);
                 }
             }
+            GuiEvent::SecondaryClicked => match (self.view, self.secondary) {
+                (View::Settings, SecondaryAction::ToggleWatch) => {
+                    gui.set_status("Updating watch task…");
+                    spawn_watch_toggle(gui.handle());
+                }
+                _ => {}
+            },
             GuiEvent::BackupClicked => match self.view {
                 View::Devices => {
                     if self.backup_running {
@@ -257,7 +291,17 @@ impl App {
                 }
             },
             GuiEvent::Worker(Msg::InventoryLoaded(Ok(devices))) => {
-                let rows: Vec<Vec<String>> = devices.iter().map(row_for).collect();
+                // Load lock records once to compute per-row status.
+                let lock_set = dg_win::store::Store::open_default()
+                    .and_then(|s| s.list_locks())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|lr| lr.hardware_id.to_ascii_lowercase())
+                    .collect::<std::collections::HashSet<String>>();
+                let rows: Vec<Vec<String>> = devices
+                    .iter()
+                    .map(|d| row_for(d, &lock_set))
+                    .collect();
                 if self.view == View::Devices {
                     gui.set_rows(&rows);
                 }
@@ -272,7 +316,8 @@ impl App {
                         })
                     })
                     .count();
-                self.last_device_count = Some(devices.len());
+                self.last_devices = Some(devices);
+                self.last_device_count = Some(self.last_devices.as_ref().map(|v| v.len()).unwrap_or(0));
                 self.last_microsoft_count = Some(microsoft);
                 gui.set_status(&format!(
                     "{} devices · {} using a Microsoft driver",
@@ -340,14 +385,103 @@ impl App {
             GuiEvent::Worker(Msg::HistoryLoaded(Err(e))) => {
                 gui.set_status(&format!("Could not load history: {e}"));
             }
+            GuiEvent::Worker(Msg::LockFinished { locked, message }) => {
+                gui.set_status(&message);
+                // Refresh the Devices view to pick up the new lock state.
+                if self.view == View::Devices {
+                    spawn_inventory(gui.handle());
+                } else if self.view == View::Settings {
+                    self.render_settings(gui);
+                }
+                let _ = locked; // reserved for future icon state
+            }
+            GuiEvent::Worker(Msg::WatchToggled { registered, message }) => {
+                gui.set_status(&message);
+                let _ = registered;
+                if self.view == View::Settings {
+                    self.render_settings(gui);
+                }
+            }
+            GuiEvent::RowActivated(idx) => self.on_row_activated(idx, gui),
             GuiEvent::Closed => {}
         }
     }
+
+    fn on_row_activated(&mut self, idx: usize, gui: &Gui<Msg>) {
+        match self.view {
+            View::Devices => {
+                let Some(devices) = self.last_devices.as_ref() else { return };
+                let Some(ds) = devices.get(idx) else { return };
+                self.prompt_lock_toggle(ds, gui);
+            }
+            View::Backups | View::History | View::Settings => {
+                // Row activation is currently meaningful only on
+                // Devices; other views ignore double-click/Enter.
+            }
+        }
+    }
+
+    fn prompt_lock_toggle(&self, ds: &DeviceSnapshot, gui: &Gui<Msg>) {
+        use dg_win::gui::{show_message, MsgButtons, MsgIcon, MsgResult};
+        // Determine current lock state from the primary hardware ID.
+        let primary = match ds.device.hardware_ids.first() {
+            Some(h) => h.clone(),
+            None => {
+                show_message(
+                    "DriverGuard",
+                    "This device has no hardware IDs; it cannot be locked.",
+                    MsgButtons::Ok,
+                    MsgIcon::Info,
+                );
+                return;
+            }
+        };
+        let is_locked = dg_win::store::Store::open_default()
+            .and_then(|s| s.get_lock(&primary))
+            .ok()
+            .flatten()
+            .is_some();
+        let title = "DriverGuard";
+        let prompt = if is_locked {
+            format!(
+                "Unlock '{}' (hardware ID '{}')?\n\n\
+                 This removes the hardware ID from the per-device deny list.\n\
+                 Windows Update will be able to replace this driver again.",
+                ds.device.name, primary
+            )
+        } else {
+            format!(
+                "Lock '{}' (hardware ID '{}') against driver replacement?\n\n\
+                 DriverGuard will (1) create a system restore point,\n\
+                 (2) add the hardware ID to the per-device deny policy, and\n\
+                 (3) verify the policy took effect.",
+                ds.device.name, primary
+            )
+        };
+        let res = show_message(title, &prompt, MsgButtons::YesNo, MsgIcon::Question);
+        if res != MsgResult::Yes {
+            return;
+        }
+        let device_name = ds.device.name.clone();
+        gui.set_status(if is_locked {
+            "Requesting elevation to unlock…"
+        } else {
+            "Requesting elevation to lock…"
+        });
+        spawn_lock_toggle(gui.handle(), primary, device_name, is_locked);
+    }
 }
 
-/// One list row for a device (pure; unit-tested).
-fn row_for(ds: &DeviceSnapshot) -> Vec<String> {
+/// One list row for a device. Lock column reports whether any of the
+/// device's hardware IDs appears in the active lock records (set passed
+/// in lowercased from the caller).
+fn row_for(ds: &DeviceSnapshot, lock_set: &std::collections::HashSet<String>) -> Vec<String> {
     let device = &ds.device;
+    let locked = device
+        .hardware_ids
+        .iter()
+        .any(|h| lock_set.contains(&h.to_ascii_lowercase()));
+    let lock_text = if locked { "Locked" } else { "" };
     match &ds.driver {
         Some(d) => vec![
             device.name.clone(),
@@ -356,9 +490,10 @@ fn row_for(ds: &DeviceSnapshot) -> Vec<String> {
             d.version.to_string(),
             d.date.to_string(),
             match DriverSource::from_provider(&d.provider) {
-                DriverSource::Microsoft => "From Microsoft".to_owned(),
-                DriverSource::Vendor(_) => "From vendor".to_owned(),
+                DriverSource::Microsoft => "Microsoft".to_owned(),
+                DriverSource::Vendor(_) => "Vendor".to_owned(),
             },
+            lock_text.to_owned(),
         ],
         None => vec![
             device.name.clone(),
@@ -367,8 +502,118 @@ fn row_for(ds: &DeviceSnapshot) -> Vec<String> {
             "—".to_owned(),
             "—".to_owned(),
             "No driver".to_owned(),
+            lock_text.to_owned(),
         ],
     }
+}
+
+/// Run a lock or unlock on a worker thread and post the result.
+fn spawn_lock_toggle(handle: GuiHandle<Msg>, hardware_id: String, device_name: String, unlock: bool) {
+    std::thread::spawn(move || {
+        let (locked, message) = run_lock_toggle(&hardware_id, &device_name, unlock);
+        handle.post(Msg::LockFinished { locked, message });
+    });
+}
+
+fn run_lock_toggle(hardware_id: &str, device_name: &str, unlock: bool) -> (bool, String) {
+    // Read policy state (unelevated read is fine) and build plan.
+    let current = match dg_win::policy::read_state() {
+        Ok(s) => s,
+        Err(e) => {
+            return (false, format!("Could not read policy state: {e}"));
+        }
+    };
+    let mut store = match dg_win::store::Store::open_default() {
+        Ok(s) => s,
+        Err(e) => return (false, format!("Could not open history store: {e}")),
+    };
+    if unlock {
+        let prior = match store.get_lock(hardware_id) {
+            Ok(Some(rec)) => rec.prior,
+            Ok(None) => current.clone(),
+            Err(e) => return (false, format!("Could not read prior lock state: {e}")),
+        };
+        let plan = dg_core::plan_unlock(&current, hardware_id, prior.deny_enabled, device_name);
+        if plan.is_empty() {
+            return (false, format!("{device_name} is not currently locked."));
+        }
+        match dg_win::elevate::run_apply_lock(&plan) {
+            Ok(msg) => {
+                let _ = store.remove_lock(hardware_id);
+                let detail = serde_json::json!({
+                    "hardware_id": hardware_id,
+                    "device_name": device_name,
+                });
+                let _ = store.record_event(
+                    dg_core::EventKind::LockRemoved,
+                    &dg_win::now_iso8601_utc(),
+                    &format!("Unlocked {device_name}"),
+                    Some(&detail.to_string()),
+                );
+                (false, format!("Unlocked {device_name}. {msg}"))
+            }
+            Err(e) => (false, format!("Unlock failed: {e}")),
+        }
+    } else {
+        let plan = dg_core::plan_lock(&current, hardware_id, device_name);
+        match dg_win::elevate::run_apply_lock(&plan) {
+            Ok(msg) => {
+                let rec = dg_core::LockRecord {
+                    hardware_id: hardware_id.to_owned(),
+                    device_name: device_name.to_owned(),
+                    prior: current,
+                    applied_at: dg_win::now_iso8601_utc(),
+                };
+                let _ = store.record_lock(&rec);
+                let detail = serde_json::json!({
+                    "hardware_id": hardware_id,
+                    "device_name": device_name,
+                });
+                let _ = store.record_event(
+                    dg_core::EventKind::LockApplied,
+                    &rec.applied_at,
+                    &format!("Locked {device_name} against driver replacement"),
+                    Some(&detail.to_string()),
+                );
+                (true, format!("Locked {device_name}. {msg}"))
+            }
+            Err(e) => (false, format!("Lock failed: {e}")),
+        }
+    }
+}
+
+/// Toggle the scheduled watch task on a worker thread and report the
+/// result to the UI. Uses the current state to decide register vs.
+/// unregister.
+fn spawn_watch_toggle(handle: GuiHandle<Msg>) {
+    std::thread::spawn(move || {
+        let currently = dg_win::system::is_watch_task_registered().unwrap_or(false);
+        let msg = if currently {
+            match dg_win::system::unregister_watch_task() {
+                Ok(()) => Msg::WatchToggled {
+                    registered: false,
+                    message: "DriverGuard Watch task removed.".to_owned(),
+                },
+                Err(e) => Msg::WatchToggled {
+                    registered: currently,
+                    message: format!("Could not unregister watch task: {e}"),
+                },
+            }
+        } else {
+            match dg_win::system::current_exe_path().and_then(|p| dg_win::system::register_watch_task(&p))
+            {
+                Ok(()) => Msg::WatchToggled {
+                    registered: true,
+                    message: "DriverGuard Watch task registered (runs at logon).".to_owned(),
+                },
+                Err(e) => Msg::WatchToggled {
+                    registered: currently,
+                    message: format!("Could not register watch task: {e}"),
+                },
+            }
+        };
+        handle.post(msg);
+    });
 }
 
 /// Load the inventory on a worker thread, record it in history (like
@@ -513,7 +758,8 @@ mod tests {
 
     #[test]
     fn row_for_vendor_driver() {
-        let row = row_for(&device(Some(driver("AMD"))));
+        let locks = HashSet::new();
+        let row = row_for(&device(Some(driver("AMD"))), &locks);
         assert_eq!(
             row,
             vec![
@@ -522,21 +768,32 @@ mod tests {
                 "AMD",
                 "31.0.15.3621",
                 "2026-06-15",
-                "From vendor"
+                "Vendor",
+                ""
             ]
         );
     }
 
     #[test]
     fn row_for_microsoft_driver() {
-        let row = row_for(&device(Some(driver("Microsoft"))));
-        assert_eq!(row[5], "From Microsoft");
+        let locks = HashSet::new();
+        let row = row_for(&device(Some(driver("Microsoft"))), &locks);
+        assert_eq!(row[5], "Microsoft");
     }
 
     #[test]
     fn row_for_driverless_device() {
-        let row = row_for(&device(None));
-        assert_eq!(row, vec!["Test GPU", "Display", "—", "—", "—", "No driver"]);
+        let locks = HashSet::new();
+        let row = row_for(&device(None), &locks);
+        assert_eq!(row, vec!["Test GPU", "Display", "—", "—", "—", "No driver", ""]);
+    }
+
+    #[test]
+    fn row_for_locked_device() {
+        let mut locks = HashSet::new();
+        locks.insert("pci\\test".to_owned());
+        let row = row_for(&device(Some(driver("AMD"))), &locks);
+        assert_eq!(row[6], "Locked");
     }
 
     #[test]
