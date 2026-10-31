@@ -160,6 +160,52 @@ pub fn open_folder_in_shell(path: &std::path::Path) -> Result<()> {
     }
 }
 
+/// Modal-result code from [`show_message`]. Returned as a plain integer
+/// so `dg-ui` can compare without importing Win32 types: the values match
+/// Win32 IDOK/IDCANCEL/IDYES/IDNO (1/2/6/7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgResult {
+    Ok = 1,
+    Cancel = 2,
+    Yes = 6,
+    No = 7,
+}
+
+/// Buttons shown by [`show_message`]; mirrors the four MB_* flag sets we
+/// need (OK, OKCancel, YesNo, YesNoCancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgButtons {
+    Ok,
+    OkCancel,
+    YesNo,
+}
+
+/// Which icon to show next to the message (mirrors the MB_ICON* flags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MsgIcon {
+    Info,
+    Warning,
+    Error,
+    Question,
+}
+
+/// Show a modal message box on the current thread's desktop. Safe
+/// wrapper around `MessageBoxW` for the small set of dialogs the UI
+/// needs (confirmations, completion notices, error reporting). On
+/// non-Windows platforms this is a no-op that returns Ok with the
+/// cancel-equivalent, so callers default to the safe path.
+pub fn show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIcon) -> MsgResult {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe_show_message(title, text, buttons, icon)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (title, text, buttons, icon);
+        MsgResult::Cancel
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Windows implementation (all unsafe lives here).
 // ---------------------------------------------------------------------------
@@ -318,6 +364,50 @@ fn unsafe_open_folder(path: &std::path::Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_open_folder(_path: &std::path::Path) -> Result<()> {
+    Err(crate::WinError::NotImplemented)
+}
+
+#[cfg(target_os = "windows")]
+fn unsafe_show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIcon) -> MsgResult {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+        MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT,
+    };
+    let flags = match buttons {
+        MsgButtons::Ok => MB_OK,
+        MsgButtons::OkCancel => MB_OKCANCEL,
+        MsgButtons::YesNo => MB_YESNO,
+    } | match icon {
+        MsgIcon::Info => MB_ICONINFORMATION,
+        MsgIcon::Warning => MB_ICONWARNING,
+        MsgIcon::Error => MB_ICONERROR,
+        MsgIcon::Question => MB_ICONQUESTION,
+    };
+    let t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let m: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::core::PCWSTR;
+    // SAFETY: MessageBoxW with a null HWND owner shows a task-modal
+    // dialog on the current desktop; our wide strings are valid for
+    // the duration of the synchronous call. No input state is mutated.
+    let res: MESSAGEBOX_RESULT = unsafe {
+        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), flags)
+    };
+    match res.0 as i32 {
+        1 => MsgResult::Ok,
+        2 => MsgResult::Cancel,
+        6 => MsgResult::Yes,
+        7 => MsgResult::No,
+        _ => MsgResult::Cancel,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_show_message(_title: &str, _text: &str, _buttons: MsgButtons, _icon: MsgIcon) -> MsgResult {
+    MsgResult::Cancel
 }
 
 #[cfg(target_os = "windows")]
