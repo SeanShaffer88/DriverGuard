@@ -4,9 +4,11 @@
 //! over CfgMgr32/SetupAPI and friends), and every `unsafe` block must carry
 //! a comment stating the invariants it relies on.
 //!
-//! Module status: `inventory`, `backup`, `store`, `gui`, and `elevate`
-//! are implemented; `policy` and `system` are documented stubs returning
-//! [`WinError::NotImplemented`] until their releases land (plan §8).
+//! Module status: `inventory`, `backup`, `store` (with the events audit
+//! log), `gui` (with four-view navigation), and `elevate` are implemented
+//! for v0.1 See & Save; `policy` and `system` are documented stubs
+//! returning [`WinError::NotImplemented`] until their releases land
+//! (plan §8).
 
 // NOTE: `#![forbid(unsafe_code)]` is intentionally not set here — this crate
 // is the designated FFI layer. It *is* set in `dg-core` and `dg-ui`.
@@ -726,7 +728,8 @@ pub mod backup {
 pub mod store {
     use super::{Path, Result, WinError};
     use dg_core::{
-        BackupManifest, Device, DeviceSnapshot, DriverDate, DriverInfo, DriverVersion, Snapshot,
+        BackupManifest, Device, DeviceSnapshot, DriverDate, DriverInfo, DriverVersion, Event,
+        EventKind, Snapshot,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use std::path::PathBuf;
@@ -754,6 +757,20 @@ CREATE TABLE IF NOT EXISTS backups (
     manifest_json TEXT NOT NULL
 );
 PRAGMA user_version = 1;
+";
+
+    // v2 adds the events audit log referenced by the plan §2.3 and by
+    // every command that produces a user-visible outcome.
+    const SCHEMA_V2: &str = "\
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    detail_json TEXT
+);
+CREATE INDEX IF NOT EXISTS events_recorded_at_idx ON events(recorded_at DESC);
+PRAGMA user_version = 2;
 ";
 
     /// The application data directory: `%LOCALAPPDATA%\DriverGuard`.
@@ -788,11 +805,17 @@ PRAGMA user_version = 1;
             conn.execute_batch("PRAGMA foreign_keys = ON;")?;
             let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
             match version {
-                0 => conn.execute_batch(SCHEMA_V1)?,
-                1 => {}
+                0 => {
+                    conn.execute_batch(SCHEMA_V1)?;
+                    conn.execute_batch(SCHEMA_V2)?;
+                }
+                1 => {
+                    conn.execute_batch(SCHEMA_V2)?;
+                }
+                2 => {}
                 other => {
                     return Err(WinError::DataDir(format!(
-                        "unsupported database schema version {other} (this build understands 1)"
+                        "unsupported database schema version {other} (this build understands up to 2)"
                     )));
                 }
             }
@@ -978,6 +1001,52 @@ PRAGMA user_version = 1;
             }
             Ok(out)
         }
+
+        /// Append one event to the audit log. Returns the new event ID.
+        pub fn record_event(
+            &mut self,
+            kind: EventKind,
+            recorded_at: &str,
+            summary: &str,
+            detail_json: Option<&str>,
+        ) -> Result<i64> {
+            self.conn.execute(
+                "INSERT INTO events (kind, recorded_at, summary, detail_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![kind.as_tag(), recorded_at, summary, detail_json],
+            )?;
+            Ok(self.conn.last_insert_rowid())
+        }
+
+        /// Recent events, newest first, up to `limit`.
+        pub fn list_events(&self, limit: u32) -> Result<Vec<Event>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, kind, recorded_at, summary, detail_json
+                 FROM events ORDER BY id DESC LIMIT ?1",
+            )?;
+            let rows = stmt.query_map(params![limit as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (id, tag, recorded_at, summary, detail_json) = row?;
+                let kind = EventKind::from_tag(&tag).unwrap_or(EventKind::Inventory);
+                out.push(Event {
+                    id,
+                    kind,
+                    recorded_at,
+                    summary,
+                    detail_json,
+                });
+            }
+            Ok(out)
+        }
     }
 
     #[cfg(test)]
@@ -1118,6 +1187,67 @@ PRAGMA user_version = 1;
             assert_eq!(store.snapshot_count().unwrap(), 0);
             assert!(store.latest_snapshot().unwrap().is_none());
             assert!(store.list_backups().unwrap().is_empty());
+            assert!(store.list_events(10).unwrap().is_empty());
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn events_round_trip_newest_first() {
+            let dir = temp_dir("events");
+            let mut store = Store::open_at(&dir.join("db.sqlite")).unwrap();
+            let id1 = store
+                .record_event(
+                    dg_core::EventKind::Inventory,
+                    "2026-10-20T00:00:00Z",
+                    "Recorded 1 device",
+                    None,
+                )
+                .unwrap();
+            let id2 = store
+                .record_event(
+                    dg_core::EventKind::BackupCreated,
+                    "2026-10-20T00:01:00Z",
+                    "Backed up 12 packages",
+                    Some("{\"packages\":12}"),
+                )
+                .unwrap();
+            assert!(id2 > id1);
+            let listed = store.list_events(10).unwrap();
+            assert_eq!(listed.len(), 2);
+            // Newest first.
+            assert_eq!(listed[0].kind, dg_core::EventKind::BackupCreated);
+            assert_eq!(listed[0].summary, "Backed up 12 packages");
+            assert_eq!(listed[0].detail_json.as_deref(), Some("{\"packages\":12}"));
+            assert_eq!(listed[1].kind, dg_core::EventKind::Inventory);
+            // Limit is respected.
+            let one = store.list_events(1).unwrap();
+            assert_eq!(one.len(), 1);
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn schema_v1_to_v2_migration_adds_events() {
+            use rusqlite::Connection;
+            let dir = temp_dir("migrate");
+            let path = dir.join("db.sqlite");
+            // Manually build a v1 database without the events table.
+            {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute_batch(SCHEMA_V1).unwrap();
+                conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+            }
+            // Opening must migrate to v2 without error and accept events.
+            let mut store = Store::open_at(&path).unwrap();
+            let id = store
+                .record_event(
+                    dg_core::EventKind::Inventory,
+                    "2026-10-20T00:00:00Z",
+                    "migrated",
+                    None,
+                )
+                .unwrap();
+            assert!(id >= 1);
+            assert_eq!(store.list_events(10).unwrap().len(), 1);
             let _ = fs::remove_dir_all(&dir);
         }
     }

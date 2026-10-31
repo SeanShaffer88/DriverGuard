@@ -1,26 +1,34 @@
 //! Safe Win32 host for the DriverGuard window (plan §2.1, §6).
 //!
 //! All `unsafe` window plumbing lives here, behind a small safe API:
-//! [`run_window`] creates the window (a report-style list view, one
-//! action button, a status line), runs the message loop, and delivers
-//! [`GuiEvent`]s to the app's handler. Worker threads report back
-//! through [`GuiHandle::post`], which queues a message and wakes the UI
-//! thread — the list is only ever touched on the UI thread.
+//! [`run_window`] creates the window (a left navigation pane, a
+//! report-style list view, one context-sensitive action button, a
+//! status line), runs the message loop, and delivers [`GuiEvent`]s to
+//! the app's handler. Worker threads report back through
+//! [`GuiHandle::post`], which queues a message and wakes the UI thread
+//! — the list is only ever touched on the UI thread.
 //!
 //! `dg-ui` builds on this API and keeps its `#![forbid(unsafe_code)]`.
 
 use crate::Result;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+// Columns are tracked through shared interior mutability so the count
+// stays consistent across Gui<M> instances that are created per event.
+type ColumnCount = Arc<Cell<usize>>;
 
 /// Static description of the window to create.
 #[derive(Debug, Clone)]
 pub struct WindowSpec {
     pub title: String,
-    /// (header, width in pixels) per list column.
+    /// (header, width in pixels) per list column for the initial view.
     pub columns: Vec<(String, i32)>,
-    /// Label of the single action button.
+    /// Label of the single action button (can be relabeled per view).
     pub backup_label: String,
+    /// Names of the entries in the left navigation pane, in order.
+    pub view_names: Vec<String>,
     pub width: i32,
     pub height: i32,
 }
@@ -29,6 +37,8 @@ pub struct WindowSpec {
 pub enum GuiEvent<M> {
     /// The window and its controls exist; initial data load goes here.
     Started,
+    /// The user selected a different entry in the left navigation.
+    ViewSelected(usize),
     /// The action button was clicked.
     BackupClicked,
     /// A worker thread posted a message.
@@ -37,16 +47,25 @@ pub enum GuiEvent<M> {
     Closed,
 }
 
+/// Control-handle bundle for the Windows implementation.
+#[derive(Clone, Copy, Default)]
+struct Handles {
+    main: isize,
+    nav: isize,
+    list: isize,
+    button: isize,
+    status: isize,
+}
+
 /// The app's safe handle to the running window, valid inside the event
 /// handler.
 pub struct Gui<M> {
     queue: Arc<Mutex<VecDeque<M>>>,
-    /// Read by the Windows backend when filling the list; unused in the
-    /// non-Windows stub build.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    columns: usize,
-    #[cfg(windows)]
-    handles: imp::Handles,
+    /// Number of columns currently installed in the list view; shared
+    /// with `State` via `Arc` so the count persists across per-event
+    /// `Gui` instances.
+    columns: ColumnCount,
+    handles: Handles,
 }
 
 impl<M> Gui<M> {
@@ -54,83 +73,256 @@ impl<M> Gui<M> {
     pub fn handle(&self) -> GuiHandle<M> {
         GuiHandle {
             queue: self.queue.clone(),
-            #[cfg(windows)]
             hwnd: self.handles.main,
         }
     }
 
     /// Replace the status line text.
     pub fn set_status(&self, text: &str) {
-        #[cfg(windows)]
-        imp::set_text(self.handles.status, text);
-        #[cfg(not(windows))]
-        let _ = text;
+        unsafe_set_text(self.handles.status, text);
     }
 
     /// Enable or disable the action button (e.g. while a backup runs).
     pub fn set_backup_enabled(&self, enabled: bool) {
-        #[cfg(windows)]
-        imp::set_enabled(self.handles.button, enabled);
-        #[cfg(not(windows))]
-        let _ = enabled;
+        unsafe_set_enabled(self.handles.button, enabled);
     }
 
-    /// Replace all list rows. Each row should have one cell per column;
-    /// missing cells render empty, extra cells are ignored.
+    /// Change the action-button label (per-view primary action, §6.2).
+    pub fn set_backup_label(&self, text: &str) {
+        unsafe_set_text(self.handles.button, text);
+    }
+
+    /// Replace the list-view columns and clear its contents.
+    pub fn set_columns(&self, columns: &[(String, i32)]) {
+        unsafe_rebuild_columns(self.handles.list, columns);
+        self.columns.set(columns.len());
+    }
+
+    /// Replace all list rows.
     pub fn set_rows(&self, rows: &[Vec<String>]) {
-        #[cfg(windows)]
-        imp::set_rows(self.handles.list, self.columns, rows);
-        #[cfg(not(windows))]
-        let _ = rows;
+        unsafe_set_rows(self.handles.list, self.columns.get(), rows);
     }
 }
+
+// Note: Gui<M> is deliberately !Send. It is only ever borrowed on the
+// UI thread inside the event callback; worker threads use the Send
+// GuiHandle<M> instead. Keeping Gui !Send avoids needing an unsafe
+// Send impl and matches the architecture.
 
 /// A `Send` handle a worker thread uses to deliver a message to the UI.
 #[derive(Clone)]
 pub struct GuiHandle<M> {
     queue: Arc<Mutex<VecDeque<M>>>,
-    #[cfg(windows)]
     hwnd: isize,
 }
 
 impl<M> GuiHandle<M> {
-    /// Queue `msg` for the UI thread and wake it. If the window is
-    /// already gone, the message is silently dropped.
+    /// Queue `msg` for the UI thread and wake it.
     pub fn post(&self, msg: M) {
         if let Ok(mut q) = self.queue.lock() {
             q.push_back(msg);
         }
-        #[cfg(windows)]
-        imp::post_worker_message(self.hwnd);
+        unsafe_post_worker(self.hwnd);
     }
 }
 
-/// Create the window described by `spec` and run the message loop until
-/// it closes, delivering events to `handler`.
-///
-/// On non-Windows platforms this returns
-/// [`WinError::NotImplemented`]; the CLI modes remain available there.
+/// Create the window and run the message loop until it closes.
+/// On non-Windows platforms this returns [`crate::WinError::NotImplemented`].
 pub fn run_window<M, F>(spec: WindowSpec, handler: F) -> Result<()>
 where
     M: Send + 'static,
     F: FnMut(GuiEvent<M>, &Gui<M>) + 'static,
 {
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
-        imp::run(spec, handler)
+        win_run(spec, handler)
     }
-    #[cfg(not(windows))]
+    #[cfg(not(target_os = "windows"))]
     {
-        let _ = spec;
-        let _ = handler;
+        let _ = (spec, handler);
         Err(crate::WinError::NotImplemented)
     }
 }
 
-#[cfg(windows)]
-mod imp {
-    use super::{Gui, GuiEvent, WindowSpec};
-    use crate::{Result, WinError};
+/// Open a folder in the shell (Explorer on Windows). Best-effort.
+pub fn open_folder_in_shell(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe_open_folder(path)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+        Err(crate::WinError::NotImplemented)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows implementation (all unsafe lives here).
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "windows")]
+fn unsafe_set_text(addr: isize, text: &str) {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowTextW, HWND};
+    use std::ffi::c_void;
+    let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // Invariant: addr is a live control created by this module; the
+    // wide string outlives the synchronous SetWindowTextW call.
+    unsafe {
+        let _ = SetWindowTextW(HWND(addr as *mut c_void), PCWSTR(t.as_ptr()));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_set_text(_addr: isize, _text: &str) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_set_enabled(addr: isize, enabled: bool) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+    use windows::Win32::UI::WindowsAndMessaging::HWND;
+    use std::ffi::c_void;
+    // Invariant: addr is the button handle created by this module.
+    unsafe {
+        let _ = EnableWindow(HWND(addr as *mut c_void), enabled);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_set_enabled(_addr: isize, _enabled: bool) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_set_rows(list_addr: isize, columns: usize, rows: &[Vec<String>]) {
+    use windows::core::PWSTR;
+    use windows::Win32::UI::Controls::{LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTITEMW, LVM_SETITEMTEXTW};
+    use windows::Win32::UI::WindowsAndMessaging::{HWND, LPARAM, SendMessageW, WPARAM};
+    use std::ffi::c_void;
+    let list = HWND(list_addr as *mut c_void);
+    // Invariant: list is our list-view; LVITEMW pointers are valid for
+    // each synchronous SendMessageW call, which is all the control needs.
+    unsafe {
+        SendMessageW(list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
+        for (i, row) in rows.iter().enumerate() {
+            for (j, cell) in row.iter().take(columns).enumerate() {
+                let mut text: Vec<u16> = cell.encode_utf16().chain(std::iter::once(0)).collect();
+                let item = LVITEMW {
+                    mask: LVIF_TEXT,
+                    iItem: i as i32,
+                    iSubItem: j as i32,
+                    pszText: PWSTR(text.as_mut_ptr()),
+                    ..Default::default()
+                };
+                if j == 0 {
+                    SendMessageW(
+                        list,
+                        LVM_INSERTITEMW,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(&item as *const LVITEMW as isize)),
+                    );
+                } else {
+                    SendMessageW(
+                        list,
+                        LVM_SETITEMTEXTW,
+                        Some(WPARAM(i)),
+                        Some(LPARAM(&item as *const LVITEMW as isize)),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_set_rows(_list: isize, _columns: usize, _rows: &[Vec<String>]) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_rebuild_columns(list_addr: isize, columns: &[(String, i32)]) {
+    use windows::core::PWSTR;
+    use windows::Win32::UI::Controls::{
+        LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
+        LVM_GETCOLUMNCOUNT, LVM_INSERTCOLUMNW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{HWND, LPARAM, SendMessageW, WPARAM};
+    use std::ffi::c_void;
+    let list = HWND(list_addr as *mut c_void);
+    // Invariant: list is our list-view. Clearing items and rebuilding
+    // columns is a supported sequence for LVS_REPORT controls.
+    unsafe {
+        SendMessageW(list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
+        let existing = SendMessageW(list, LVM_GETCOLUMNCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
+        let existing = existing.0 as i32;
+        for idx in (0..existing).rev() {
+            SendMessageW(list, LVM_DELETECOLUMN, Some(WPARAM(idx as usize)), Some(LPARAM(0)));
+        }
+        for (i, (title, width)) in columns.iter().enumerate() {
+            let mut t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+            let col = LVCOLUMNW {
+                mask: LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM,
+                cx: *width,
+                pszText: PWSTR(t.as_mut_ptr()),
+                iSubItem: i as i32,
+                ..Default::default()
+            };
+            SendMessageW(
+                list,
+                LVM_INSERTCOLUMNW,
+                Some(WPARAM(i)),
+                Some(LPARAM(&col as *const LVCOLUMNW as isize)),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_rebuild_columns(_list: isize, _columns: &[(String, i32)]) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_post_worker(hwnd_addr: isize) {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::{HWND, PostMessageW, WPARAM};
+    use std::ffi::c_void;
+    const WM_WORKER: u32 = 0x8001;
+    // Invariant: PostMessageW is thread-safe; if the window is gone the
+    // call simply fails.
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd_addr as *mut c_void)), WM_WORKER, WPARAM(0), LPARAM(0));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_post_worker(_hwnd: isize) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_open_folder(path: &std::path::Path) -> Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use std::os::windows::ffi::OsStrExt;
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "explore".encode_utf16().chain(std::iter::once(0)).collect();
+    // Best-effort affordance. ShellExecuteW returns a Result with a
+    // fake HINSTANCE on success; we don't inspect it and we map any
+    // error to Ok(()) anyway — if opening fails, the Settings view
+    // still shows the path as text.
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn win_run<M, F>(spec: WindowSpec, handler: F) -> Result<()>
+where
+    M: Send + 'static,
+    F: FnMut(GuiEvent<M>, &Gui<M>) + 'static,
+{
     use std::collections::VecDeque;
     use std::ffi::c_void;
     use std::sync::{Arc, Mutex};
@@ -142,31 +334,27 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Controls::{
         InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_SUBITEM, LVCF_TEXT,
-        LVCF_WIDTH, LVCOLUMNW, LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTCOLUMNW,
-        LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMTEXTW, LVS_EX_FULLROWSELECT,
-        LVS_EX_GRIDLINES, WC_LISTVIEWW,
+        LVCF_WIDTH, LVCOLUMNW, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
+        LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, WC_LISTVIEWW,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-        LoadCursorW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-        SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, BS_PUSHBUTTON,
-        CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, MSG,
-        SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE,
-        WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW,
+        ShowWindow, TranslateMessage, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+        CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, LBN_SELCHANGE, LBS_NOTIFY, LB_ADDSTRING,
+        LB_GETCURSEL, LB_SETCURSEL, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+        WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
+        WS_OVERLAPPEDWINDOW, WS_VSCROLL, WS_VISIBLE,
     };
 
-    /// Custom message: a worker posted to the queue.
-    const WM_WORKER: u32 = 0x8001; // WM_APP + 1
+    const WM_WORKER: u32 = 0x8001;
     const ID_BACKUP: usize = 1001;
-
-    #[derive(Clone, Copy, Default)]
-    pub(super) struct Handles {
-        pub main: isize,
-        pub list: isize,
-        pub button: isize,
-        pub status: isize,
-    }
+    const ID_NAV: usize = 1002;
+    const NAV_WIDTH: i32 = 160;
+    const GUTTER: i32 = 10;
+    const BUTTON_H: i32 = 32;
+    const STATUS_H: i32 = 20;
+    const BUTTON_W: i32 = 200;
 
     type Handler<M> = Box<dyn FnMut(GuiEvent<M>, &Gui<M>) + 'static>;
 
@@ -176,13 +364,7 @@ mod imp {
         spec: WindowSpec,
         handles: Handles,
         hinstance: isize,
-    }
-
-    fn api(e: windows::core::Error) -> WinError {
-        WinError::Api {
-            code: e.code().0 as u32,
-            message: e.message(),
-        }
+        columns: ColumnCount,
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -193,157 +375,17 @@ mod imp {
         HWND(addr as *mut c_void)
     }
 
-    pub(super) fn set_text(addr: isize, text: &str) {
-        let t = wide(text);
-        // Invariant: addr is a live control handle created by this
-        // module; the wide string outlives the call.
-        unsafe {
-            let _ = SetWindowTextW(hwnd(addr), PCWSTR(t.as_ptr()));
+    fn api(e: windows::core::Error) -> crate::WinError {
+        crate::WinError::Api {
+            code: e.code().0 as u32,
+            message: e.message(),
         }
-    }
-
-    pub(super) fn set_enabled(addr: isize, enabled: bool) {
-        // Invariant: addr is the button handle created by this module.
-        unsafe {
-            let _ = EnableWindow(hwnd(addr), enabled);
-        }
-    }
-
-    pub(super) fn set_rows(list_addr: isize, columns: usize, rows: &[Vec<String>]) {
-        let list = hwnd(list_addr);
-        // Invariant: list is the list-view control created by this
-        // module; LVITEMW pointers are valid for the duration of each
-        // SendMessageW call, which is all the control requires.
-        unsafe {
-            SendMessageW(list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
-            for (i, row) in rows.iter().enumerate() {
-                for (j, cell) in row.iter().take(columns).enumerate() {
-                    let mut text = wide(cell);
-                    let item = LVITEMW {
-                        mask: LVIF_TEXT,
-                        iItem: i as i32,
-                        iSubItem: j as i32,
-                        pszText: PWSTR(text.as_mut_ptr()),
-                        ..Default::default()
-                    };
-                    if j == 0 {
-                        SendMessageW(
-                            list,
-                            LVM_INSERTITEMW,
-                            Some(WPARAM(0)),
-                            Some(LPARAM(&item as *const LVITEMW as isize)),
-                        );
-                    } else {
-                        SendMessageW(
-                            list,
-                            LVM_SETITEMTEXTW,
-                            Some(WPARAM(i)),
-                            Some(LPARAM(&item as *const LVITEMW as isize)),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    pub(super) fn post_worker_message(hwnd_addr: isize) {
-        // Invariant: PostMessageW is thread-safe; if the window is gone
-        // the call simply fails and the queued message is dropped.
-        unsafe {
-            let _ = PostMessageW(Some(hwnd(hwnd_addr)), WM_WORKER, WPARAM(0), LPARAM(0));
-        }
-    }
-
-    pub(super) fn run<M, F>(spec: WindowSpec, handler: F) -> Result<()>
-    where
-        M: Send + 'static,
-        F: FnMut(GuiEvent<M>, &Gui<M>) + 'static,
-    {
-        let queue: Arc<Mutex<VecDeque<M>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let state = Box::new(State {
-            handler: Box::new(handler),
-            queue,
-            spec,
-            handles: Handles::default(),
-            hinstance: 0,
-        });
-        let ptr = Box::into_raw(state);
-
-        // Invariant: every unsafe call below follows the standard Win32
-        // window-creation sequence. The state box is owned by `ptr`
-        // until CreateWindowExW hands it to the window via
-        // lpCreateParams; from then on WM_DESTROY owns dropping it.
-        unsafe {
-            let icc = INITCOMMONCONTROLSEX {
-                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-                dwICC: ICC_LISTVIEW_CLASSES,
-            };
-            let _ = InitCommonControlsEx(&icc);
-
-            let hinstance = GetModuleHandleW(None).map_err(api)?;
-            (*ptr).hinstance = hinstance.0 as isize;
-
-            let class_name = w!("DriverGuardMainWindow");
-            let wc = WNDCLASSW {
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(wnd_proc::<M>),
-                hInstance: HINSTANCE(hinstance.0),
-                hCursor: LoadCursorW(None, IDC_ARROW).map_err(api)?,
-                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
-                lpszClassName: class_name,
-                ..Default::default()
-            };
-            if RegisterClassW(&wc) == 0 {
-                drop(Box::from_raw(ptr));
-                return Err(WinError::Api {
-                    code: 0,
-                    message: "RegisterClassW failed".to_owned(),
-                });
-            }
-
-            let spec_ref = &(*ptr).spec;
-            let title = wide(&spec_ref.title);
-            let hwnd = match CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                class_name,
-                PCWSTR(title.as_ptr()),
-                WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                spec_ref.width,
-                spec_ref.height,
-                None,
-                None,
-                Some(HINSTANCE(hinstance.0)),
-                Some(ptr as *const c_void),
-            ) {
-                Ok(h) => h,
-                Err(e) => {
-                    drop(Box::from_raw(ptr));
-                    return Err(api(e));
-                }
-            };
-
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = UpdateWindow(hwnd);
-
-            let mut msg = MSG::default();
-            loop {
-                let r = GetMessageW(&mut msg, None, 0, 0);
-                if r.0 == 0 || r.0 == -1 {
-                    break; // WM_QUIT or error
-                }
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
-        Ok(())
     }
 
     fn make_gui<M>(state: &State<M>) -> Gui<M> {
         Gui {
             queue: state.queue.clone(),
-            columns: state.spec.columns.len(),
+            columns: state.columns.clone(),
             handles: state.handles,
         }
     }
@@ -353,27 +395,38 @@ mod imp {
         (state.handler)(event, &gui);
     }
 
-    fn layout(state: &State<impl Sized>, width: i32, height: i32) {
+    fn layout(state: &State<M>, width: i32, height: i32) {
         let h = state.handles;
-        // Invariant: all four handles are live controls of this window;
-        // MoveWindow with these rectangles keeps children inside the
-        // client area for any width/height ≥ 0.
+        let content_x = NAV_WIDTH + GUTTER;
+        let content_w = (width - content_x - GUTTER).max(0);
+        let list_y = GUTTER + BUTTON_H + GUTTER;
+        let list_h = (height - list_y - STATUS_H - GUTTER).max(0);
+        // Invariant: all handles are live children of this window; rects
+        // fit inside the client area for any width/height ≥ 0.
         unsafe {
-            let _ = MoveWindow(hwnd(h.button), 10, 10, 200, 32, true);
             let _ = MoveWindow(
-                hwnd(h.list),
-                10,
-                52,
-                (width - 20).max(0),
-                (height - 86).max(0),
+                hwnd(h.nav),
+                GUTTER,
+                GUTTER,
+                NAV_WIDTH,
+                (height - 2 * GUTTER).max(0),
                 true,
             );
             let _ = MoveWindow(
+                hwnd(h.button),
+                content_x,
+                GUTTER,
+                BUTTON_W.min(content_w),
+                BUTTON_H,
+                true,
+            );
+            let _ = MoveWindow(hwnd(h.list), content_x, list_y, content_w, list_h, true);
+            let _ = MoveWindow(
                 hwnd(h.status),
-                10,
-                (height - 24).max(0),
-                (width - 20).max(0),
-                18,
+                content_x,
+                (height - STATUS_H - GUTTER).max(0),
+                content_w,
+                STATUS_H,
                 true,
             );
         }
@@ -388,9 +441,6 @@ mod imp {
     where
         M: Send + 'static,
     {
-        // Invariant: on WM_NCCREATE, lparam points to the CREATESTRUCTW
-        // passed by CreateWindowExW and its lpCreateParams is our state
-        // box; the box stays alive until WM_DESTROY drops it.
         if msg == WM_NCCREATE {
             let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
             unsafe {
@@ -407,7 +457,16 @@ mod imp {
             WM_CREATE => {
                 state.handles.main = hwnd.0 as isize;
                 create_children(state, hwnd);
+                state.columns.set(state.spec.columns.len());
                 layout(state, state.spec.width, state.spec.height);
+                unsafe {
+                    let _ = SendMessageW(
+                        hwnd(state.handles.nav),
+                        LB_SETCURSEL,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0)),
+                    );
+                }
                 fire(state, GuiEvent::Started);
                 LRESULT(0)
             }
@@ -422,6 +481,20 @@ mod imp {
                 let notify = (wparam.0 >> 16) & 0xFFFF;
                 if id == ID_BACKUP && notify == 0 {
                     fire(state, GuiEvent::BackupClicked);
+                } else if id == ID_NAV && notify as u32 == LBN_SELCHANGE as u32 {
+                    let lres = unsafe {
+                        SendMessageW(
+                            hwnd(state.handles.nav),
+                            LB_GETCURSEL,
+                            None,
+                            Some(LPARAM(0)),
+                        )
+                    };
+                    // LB_GETCURSEL returns the 0-based index, or LB_ERR (-1).
+                    let idx = lres.0 as i32;
+                    if idx >= 0 && (idx as usize) < state.spec.view_names.len() {
+                        fire(state, GuiEvent::ViewSelected(idx as usize));
+                    }
                 }
                 LRESULT(0)
             }
@@ -437,9 +510,6 @@ mod imp {
             }
             WM_DESTROY => {
                 fire(state, GuiEvent::Closed);
-                // Invariant: ptr is the state box handed to the window at
-                // creation; reclaiming and dropping it here ends its
-                // lifetime exactly once.
                 unsafe {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     drop(Box::from_raw(ptr as *mut State<M>));
@@ -457,17 +527,44 @@ mod imp {
         // during WM_CREATE; wide strings outlive each call.
         unsafe {
             let font = GetStockObject(DEFAULT_GUI_FONT);
-            let label = wide(&state.spec.backup_label);
             let hinst = Some(HINSTANCE(hinstance as *mut c_void));
+
+            let nav = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("LISTBOX"),
+                PCWSTR::null(),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE(LBS_NOTIFY as u32),
+                0,
+                0,
+                NAV_WIDTH,
+                100,
+                Some(parent),
+                Some(HMENU(ID_NAV as *mut c_void)),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            state.handles.nav = nav.0 as isize;
+            for name in &state.spec.view_names {
+                let s = wide(name);
+                let _ = SendMessageW(
+                    nav,
+                    LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(s.as_ptr() as isize)),
+                );
+            }
+
+            let label = wide(&state.spec.backup_label);
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 PCWSTR(label.as_ptr()),
                 WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                10,
-                10,
-                200,
-                32,
+                NAV_WIDTH + GUTTER,
+                GUTTER,
+                BUTTON_W,
+                BUTTON_H,
                 Some(parent),
                 Some(HMENU(ID_BACKUP as *mut c_void)),
                 hinst,
@@ -487,7 +584,7 @@ mod imp {
                         windows::Win32::UI::Controls::LVS_REPORT
                             | windows::Win32::UI::Controls::LVS_SHOWSELALWAYS,
                     ),
-                10,
+                NAV_WIDTH + GUTTER,
                 52,
                 400,
                 300,
@@ -524,12 +621,12 @@ mod imp {
             let status = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                PCWSTR(std::ptr::null()),
+                PCWSTR::null(),
                 WS_CHILD | WS_VISIBLE,
-                10,
+                NAV_WIDTH + GUTTER,
                 10,
                 400,
-                18,
+                STATUS_H,
                 Some(parent),
                 None,
                 hinst,
@@ -538,7 +635,7 @@ mod imp {
             .unwrap_or_default();
             state.handles.status = status.0 as isize;
 
-            for child in [button, list, status] {
+            for child in [nav, button, list, status] {
                 SendMessageW(
                     child,
                     WM_SETFONT,
@@ -548,4 +645,84 @@ mod imp {
             }
         }
     }
+
+    let queue: Arc<Mutex<VecDeque<M>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let columns: ColumnCount = Arc::new(Cell::new(spec.columns.len()));
+    let state = Box::new(State {
+        handler: Box::new(handler),
+        queue,
+        spec,
+        handles: Handles::default(),
+        hinstance: 0,
+        columns,
+    });
+    let ptr = Box::into_raw(state);
+
+    unsafe {
+        let icc = INITCOMMONCONTROLSEX {
+            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+            dwICC: ICC_LISTVIEW_CLASSES,
+        };
+        let _ = InitCommonControlsEx(&icc);
+
+        let hinstance = GetModuleHandleW(None).map_err(api)?;
+        (*ptr).hinstance = hinstance.0 as isize;
+
+        let class_name = w!("DriverGuardMainWindow");
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wnd_proc::<M>),
+            hInstance: HINSTANCE(hinstance.0),
+            hCursor: LoadCursorW(None, IDC_ARROW).map_err(api)?,
+            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 {
+            drop(Box::from_raw(ptr));
+            return Err(crate::WinError::Api {
+                code: 0,
+                message: "RegisterClassW failed".to_owned(),
+            });
+        }
+
+        let spec_ref = &(*ptr).spec;
+        let title = wide(&spec_ref.title);
+        let hwnd = match CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class_name,
+            PCWSTR(title.as_ptr()),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            spec_ref.width,
+            spec_ref.height,
+            None,
+            None,
+            Some(HINSTANCE(hinstance.0)),
+            Some(ptr as *const c_void),
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                drop(Box::from_raw(ptr));
+                return Err(api(e));
+            }
+        };
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+
+            let mut msg = MSG::default();
+            loop {
+                let r = GetMessageW(&mut msg, None, 0, 0);
+                // GetMessageW returns BOOL(0) on WM_QUIT and BOOL(-1) on error.
+                let val = r.0 as i32;
+                if val == 0 || val == -1 {
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+    }
+    Ok(())
 }

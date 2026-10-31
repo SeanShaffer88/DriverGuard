@@ -66,7 +66,17 @@ fn inventory() -> ExitCode {
             match serde_json::to_string_pretty(&snapshot) {
                 Ok(json) => {
                     println!("{json}");
-                    record_snapshot_best_effort(&snapshot, "cli");
+                    let device_count = snapshot.devices.len();
+                    let snap_id = record_snapshot_best_effort(&snapshot, "cli");
+                    record_event_best_effort(
+                        dg_core::EventKind::Inventory,
+                        &format!("Recorded {device_count} devices (snapshot #{snap_id})"),
+                        Some(serde_json::json!({
+                            "device_count": device_count,
+                            "snapshot_id": snap_id,
+                            "origin": "cli",
+                        }).to_string()),
+                    );
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -84,27 +94,58 @@ fn inventory() -> ExitCode {
 
 /// Recording history is best-effort: the database is a cache (plan §2.3),
 /// so a history failure warns on stderr but never fails the command the
-/// user actually asked for.
-fn record_snapshot_best_effort(snapshot: &dg_core::Snapshot, origin: &str) {
+/// user actually asked for. Returns the snapshot id when recorded, or 0.
+fn record_snapshot_best_effort(snapshot: &dg_core::Snapshot, origin: &str) -> i64 {
     match dg_win::store::Store::open_default() {
-        Ok(mut store) => {
-            match store.record_snapshot(&dg_win::now_iso8601_utc(), origin, snapshot) {
-                Ok(id) => eprintln!("(recorded as snapshot #{id} in history)"),
-                Err(e) => eprintln!("warning: could not record snapshot in history: {e}"),
+        Ok(mut store) => match store.record_snapshot(&dg_win::now_iso8601_utc(), origin, snapshot) {
+            Ok(id) => {
+                eprintln!("(recorded as snapshot #{id} in history)");
+                id
             }
+            Err(e) => {
+                eprintln!("warning: could not record snapshot in history: {e}");
+                0
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: history unavailable: {e}");
+            0
         }
-        Err(e) => eprintln!("warning: history unavailable: {e}"),
     }
 }
 
 fn record_backup_best_effort(folder: &std::path::Path, manifest: &dg_core::BackupManifest) {
     match dg_win::store::Store::open_default() {
-        Ok(store) => {
+        Ok(mut store) => {
             if let Err(e) = store.record_backup(folder, manifest) {
                 eprintln!("warning: could not record backup in history: {e}");
             }
+            let detail = serde_json::json!({
+                "folder": folder.display().to_string(),
+                "package_count": manifest.packages.len(),
+                "created_utc": manifest.created_utc,
+            });
+            let _ = store.record_event(
+                dg_core::EventKind::BackupCreated,
+                &dg_win::now_iso8601_utc(),
+                &format!(
+                    "Backed up {} driver packages to {}",
+                    manifest.packages.len(),
+                    folder.display()
+                ),
+                Some(&detail.to_string()),
+            );
         }
         Err(e) => eprintln!("warning: history unavailable: {e}"),
+    }
+}
+
+fn record_event_best_effort(kind: dg_core::EventKind, summary: &str, detail: Option<String>) {
+    match dg_win::store::Store::open_default() {
+        Ok(mut store) => {
+            let _ = store.record_event(kind, &dg_win::now_iso8601_utc(), summary, detail.as_deref());
+        }
+        Err(_) => {}
     }
 }
 
@@ -113,7 +154,8 @@ fn backup_cmd(args: &[String]) -> ExitCode {
         eprintln!("usage: driverguard backup <folder>\n\n{USAGE}");
         return ExitCode::FAILURE;
     };
-    match dg_win::backup::export_drivers_elevated(std::path::Path::new(dir)) {
+    let folder = std::path::Path::new(dir);
+    match dg_win::backup::export_drivers_elevated(folder) {
         Ok(manifest) => {
             println!(
                 "Backed up {} driver packages to {dir}:",
@@ -123,11 +165,20 @@ fn backup_cmd(args: &[String]) -> ExitCode {
                 println!("  {} — {} {}", p.inf_name, p.provider, p.version);
             }
             println!("Manifest written and verified.");
-            record_backup_best_effort(std::path::Path::new(dir), &manifest);
+            record_backup_best_effort(folder, &manifest);
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("backup failed: {e}");
+            let detail = serde_json::json!({
+                "folder": dir,
+                "error": e.to_string(),
+            });
+            record_event_best_effort(
+                dg_core::EventKind::BackupFailed,
+                &format!("Backup to {dir} failed"),
+                Some(detail.to_string()),
+            );
             ExitCode::FAILURE
         }
     }
@@ -173,6 +224,7 @@ fn history_report() -> Result<String, dg_win::WinError> {
     let count = store.snapshot_count()?;
     let latest = store.latest_snapshot()?;
     let backups = store.list_backups()?;
+    let events = store.list_events(50)?;
     let mut out = String::from("DriverGuard history\n");
     out.push_str(&format!("  snapshots recorded: {count}\n"));
     match &latest {
@@ -191,6 +243,19 @@ fn history_report() -> Result<String, dg_win::WinError> {
             manifest.packages.len(),
             manifest.created_utc
         ));
+    }
+    out.push_str(&format!("  recent events: {}\n", events.len()));
+    if events.is_empty() {
+        out.push_str("    (none yet — run `driverguard inventory` or `driverguard backup`)\n");
+    } else {
+        for ev in &events {
+            out.push_str(&format!(
+                "    [{}] {} — {}\n",
+                ev.recorded_at,
+                ev.kind.as_tag(),
+                ev.summary
+            ));
+        }
     }
     Ok(out.trim_end().to_owned())
 }

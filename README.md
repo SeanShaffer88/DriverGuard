@@ -8,8 +8,9 @@ user-chosen driver (GPU drivers are the classic case) with an older
 Microsoft-supplied one — and the built-in recovery paths don't always help.
 DriverGuard exists to make that situation boring.
 
-> **Status: v0.1 — feature-complete in code, on-machine verification in
-> progress.** Inventory, backup, history, and the Drivers window are
+> **Status: v0.1 — code-complete, on-machine verification in progress.**
+> Inventory, backup, history (with the events audit log), and the
+> four-view window (Devices · Backups · History · Settings) are
 > implemented and CI-tested on Windows. The v0.1 exit check — the full
 > backup scenario run on real Windows 11 Home and Pro machines — has not
 > been done yet, so treat this as a pre-release: try it, and please

@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "DriverGuard native Win32 user interface (planned; see docs/ARCHITECTURE_AND_UX_PLAN.md section 6)."
+description = "DriverGuard native Win32 user interface: four-view window (Devices, Backups, History, Settings) for v0.1 See & Save."
 
 [dependencies]
 dg-core = { path = "../dg-core", version = "0.1.0" }
 dg-win = { path = "../dg-win", version = "0.1.0" }
+serde_json = { workspace = true }

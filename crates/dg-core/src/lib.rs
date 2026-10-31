@@ -256,6 +256,57 @@ pub fn plan_unlock(current: &PolicyState, hardware_id: &str, originally_enabled:
 }
 
 // ---------------------------------------------------------------------------
+// History events
+// ---------------------------------------------------------------------------
+
+/// The kind of thing that happened. Driver-change events land in v0.3;
+/// v0.1 records inventory runs and backup outcomes (plan §8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventKind {
+    Inventory,
+    BackupCreated,
+    BackupFailed,
+}
+
+impl EventKind {
+    pub fn as_tag(&self) -> &'static str {
+        match self {
+            EventKind::Inventory => "inventory",
+            EventKind::BackupCreated => "backup-created",
+            EventKind::BackupFailed => "backup-failed",
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "inventory" => Some(EventKind::Inventory),
+            "backup-created" => Some(EventKind::BackupCreated),
+            "backup-failed" => Some(EventKind::BackupFailed),
+            _ => None,
+        }
+    }
+}
+
+/// One entry in the user-visible History log (plan §2.3 `events` table).
+///
+/// Everything DriverGuard does lands here so the user has an audit trail.
+/// v0.1 records inventory snapshots and backup outcomes; v0.2 adds
+/// lock/unlock and restore-point events; v0.3 adds driver-change detection
+/// and restore events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    pub id: i64,
+    pub kind: EventKind,
+    /// RFC 3339 UTC timestamp.
+    pub recorded_at: String,
+    /// Short human-readable summary, e.g. "Backed up 12 driver packages".
+    pub summary: String,
+    /// Optional JSON detail blob (device/version before/after, folder, …).
+    /// Free-form; the UI renders it in a Technical-details expander.
+    pub detail_json: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Backup manifest
 // ---------------------------------------------------------------------------
 
@@ -553,5 +604,17 @@ mod tests {
         // Leap day with a mid-day time.
         assert_eq!(iso8601_utc_from_unix(951_827_696), "2000-02-29T12:34:56Z");
         assert_eq!(iso8601_utc_from_unix(1_792_454_400), "2026-10-20T00:00:00Z");
+    }
+
+    #[test]
+    fn event_kind_round_trips_via_tag() {
+        for kind in [
+            EventKind::Inventory,
+            EventKind::BackupCreated,
+            EventKind::BackupFailed,
+        ] {
+            assert_eq!(EventKind::from_tag(kind.as_tag()), Some(kind));
+        }
+        assert_eq!(EventKind::from_tag("not-a-kind"), None);
     }
 }
