@@ -10,6 +10,7 @@ description = "DriverGuard Windows platform layer: CfgMgr32/SetupAPI, pnputil, p
 [dependencies]
 dg-core = { path = "../dg-core", version = "0.1.0" }
 rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
@@ -22,6 +23,7 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_UI_Controls",
