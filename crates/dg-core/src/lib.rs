@@ -203,6 +203,9 @@ pub struct PolicyState {
 }
 
 /// One primitive policy mutation. A plan is an ordered list of these.
+/// A plan can also contain an InstallDriver step, which is not a
+/// registry mutation but is carried along so the elevated helper can
+/// run pnputil between the lift and relock steps (plan §3.5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyOp {
     SetDenyEnabled(bool),
@@ -217,6 +220,9 @@ pub enum PolicyOp {
     /// "unlock everything" when we were the ones who created it and
     /// there are no foreign entries left).
     DeleteDenySubkey,
+    /// Run `pnputil /add-driver <target> /subdirs /install` (v0.3
+    /// restore). The target is an absolute path to an INF or folder.
+    InstallDriver { target: String },
 }
 
 /// A lock record stored in the database for one hardware ID that
@@ -395,6 +401,13 @@ pub enum EventKind {
     PolicyChanged,
     RestorePointCreated,
     RestoreFailed,
+    /// v0.3: watch mode detected one or more driver changes between
+    /// snapshots.
+    DriverChanged,
+    /// v0.3: one-click driver restore completed successfully.
+    DriverRestored,
+    /// v0.3: one-click driver restore failed.
+    RestoreFailedDriver,
 }
 
 impl EventKind {
@@ -409,6 +422,9 @@ impl EventKind {
             EventKind::PolicyChanged => "policy-changed",
             EventKind::RestorePointCreated => "restore-point-created",
             EventKind::RestoreFailed => "restore-failed",
+            EventKind::DriverChanged => "driver-changed",
+            EventKind::DriverRestored => "driver-restored",
+            EventKind::RestoreFailedDriver => "restore-driver-failed",
         }
     }
 
@@ -423,6 +439,9 @@ impl EventKind {
             "policy-changed" => Some(EventKind::PolicyChanged),
             "restore-point-created" => Some(EventKind::RestorePointCreated),
             "restore-failed" => Some(EventKind::RestoreFailed),
+            "driver-changed" => Some(EventKind::DriverChanged),
+            "driver-restored" => Some(EventKind::DriverRestored),
+            "restore-driver-failed" => Some(EventKind::RestoreFailedDriver),
             _ => None,
         }
     }
@@ -489,7 +508,71 @@ impl BackupManifest {
     }
 }
 
-/// Format a Unix timestamp (seconds since 1970-01-01T00:00:00Z) as an
+// ---------------------------------------------------------------------------
+// Restore plan (one-click driver restore from backup, plan §3.5)
+// ---------------------------------------------------------------------------
+
+/// What the restore flow does for one backed-up driver package. The
+/// plan is executed in order by the elevated helper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestoreStep {
+    pub kind: RestoreStepKind,
+    pub hardware_id: Option<String>,
+    /// Absolute path to the INF or backup folder to pass to pnputil.
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestoreStepKind {
+    /// Create a system restore point before touching anything.
+    CreateRestorePoint,
+    /// Temporarily lift our deny entry for the device so our own lock
+    /// does not block the install (§3.5 step 1).
+    LiftLock,
+    /// Run `pnputil /add-driver <target> /subdirs /install`.
+    InstallDriver,
+    /// Re-apply the deny entry if we lifted it, so the lock is back in
+    /// place after the install (§3.5 step 4).
+    Relock,
+}
+
+/// Build the ordered restore plan for one device, given whether
+/// DriverGuard currently holds a lock on it.
+///
+/// The plan is: create restore point → (if locked) lift our deny entry
+/// → pnputil /add-driver /install → (if we lifted) re-apply the entry.
+/// Verification (re-read the device to confirm the bound driver
+/// matches the backup, and offer a restart prompt) is the caller's
+/// responsibility — policy/process work is done by the helper.
+pub fn plan_restore(
+    locked_by_us: bool,
+    hardware_id: &str,
+    inf_target: &str,
+    device_name: &str,
+) -> LockPlan {
+    // Reuse LockPlan as the operation container (create_restore_point,
+    // description, ops) so the elevated helper can apply it through
+    // the same apply_plan path. We emit Add/Remove policy ops for the
+    // lift/relock alongside an "install driver" marker op added below.
+    let mut ops = Vec::new();
+    if locked_by_us {
+        ops.push(PolicyOp::RemoveDeniedHardwareId(hardware_id.to_owned()));
+    }
+    ops.push(PolicyOp::InstallDriver {
+        target: inf_target.to_owned(),
+    });
+    if locked_by_us {
+        ops.push(PolicyOp::AddDeniedHardwareId(hardware_id.to_owned()));
+    }
+    LockPlan {
+        create_restore_point: true,
+        description: format!("Restore driver for {device_name} from backup"),
+        ops,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format a Unix timestamp (seconds since 1970-01-01T00:00:00Z) as an
 /// RFC 3339 UTC string, e.g. `"2026-10-20T00:00:00Z"`. Pure arithmetic —
 /// no clock access and no timezone database.
 pub fn iso8601_utc_from_unix(epoch_secs: u64) -> String {
@@ -828,9 +911,43 @@ mod tests {
             EventKind::Inventory,
             EventKind::BackupCreated,
             EventKind::BackupFailed,
+            EventKind::LockApplied,
+            EventKind::LockRemoved,
+            EventKind::UnlockAll,
+            EventKind::PolicyChanged,
+            EventKind::RestorePointCreated,
+            EventKind::RestoreFailed,
+            EventKind::DriverChanged,
+            EventKind::DriverRestored,
+            EventKind::RestoreFailedDriver,
         ] {
             assert_eq!(EventKind::from_tag(kind.as_tag()), Some(kind));
         }
         assert_eq!(EventKind::from_tag("not-a-kind"), None);
+    }
+
+    #[test]
+    fn plan_restore_lifts_then_relocks_when_locked() {
+        let plan = plan_restore(true, r"PCI\VEN_1002", "C:\\b\\oem.inf", "Test GPU");
+        assert!(plan.create_restore_point);
+        assert!(matches!(
+            plan.ops.first(),
+            Some(PolicyOp::RemoveDeniedHardwareId(id)) if id == r"PCI\VEN_1002"
+        ));
+        assert!(matches!(
+            plan.ops.get(1),
+            Some(PolicyOp::InstallDriver { target }) if target == "C:\\b\\oem.inf"
+        ));
+        assert!(matches!(
+            plan.ops.get(2),
+            Some(PolicyOp::AddDeniedHardwareId(id)) if id == r"PCI\VEN_1002"
+        ));
+    }
+
+    #[test]
+    fn plan_restore_skips_lift_when_not_locked() {
+        let plan = plan_restore(false, r"PCI\VEN_1002", "C:\\b\\oem.inf", "Test GPU");
+        assert_eq!(plan.ops.len(), 1);
+        assert!(matches!(&plan.ops[0], PolicyOp::InstallDriver { .. }));
     }
 }

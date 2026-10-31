@@ -26,7 +26,10 @@ USAGE:
                                       Toggle the global 'exclude drivers from Windows
                                       Quality Updates' policy
     driverguard status                Print current policy state and active locks
-    driverguard --watch               Run one headless driver-change check (planned, v0.3)
+    driverguard --watch               Run one headless driver-change check (v0.3 watchdog)
+    driverguard register-watch        Register the DriverGuard Watch scheduled task
+                                      (runs --watch at logon)
+    driverguard unregister-watch      Remove the DriverGuard Watch scheduled task
     driverguard --version             Print version
     driverguard --help                Show this help
 ";
@@ -60,10 +63,9 @@ fn main() -> ExitCode {
         Some("unlock-all") => unlock_all_cmd(),
         Some("exclude-wu-drivers") => exclude_wu_cmd(&args),
         Some("status") => status_cmd(),
-        Some("--watch") => {
-            eprintln!("--watch is not implemented yet (planned for v0.3).");
-            ExitCode::SUCCESS
-        }
+        Some("--watch") => watch_cmd(),
+        Some("register-watch") => register_watch_cmd(),
+        Some("unregister-watch") => unregister_watch_cmd(),
         Some(other) => {
             eprintln!("Unknown argument: {other}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -458,6 +460,123 @@ fn exclude_wu_cmd(args: &[String]) -> ExitCode {
         }
         Ok((String::new(), format!("Exclude WU drivers set to {}. {}", if on { "on" } else { "off" }, msg)))
     })
+}
+
+/// Watch mode: perform one inventory snapshot, diff it against the
+/// last saved snapshot, and if anything changed record a
+/// DriverChanged event and raise a toast. This is the entry point
+/// invoked by the `DriverGuard Watch` scheduled task (plan §3.4).
+///
+/// Exit code is always SUCCESS — watch mode is best-effort and
+/// must never pop an error dialog on the user's desktop; failures
+/// are recorded in the history log as RestoreFailed-driver style
+/// error entries so they are visible to the user on next open.
+fn watch_cmd() -> ExitCode {
+    let mut store = match dg_win::store::Store::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("watch: could not open store: {e}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let before: Option<dg_core::Snapshot> = match store.latest_snapshot() {
+        Ok(Some((_, snap))) => Some(snap),
+        _ => None,
+    };
+    let devices = match dg_win::inventory::snapshot() {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = store.record_event(
+                dg_core::EventKind::RestoreFailedDriver,
+                "watch: could not enumerate devices",
+                &e.to_string(),
+                None,
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+    let after = dg_core::Snapshot { devices };
+    let Some(prior) = before else {
+        // First run ever (or no snapshot yet) — record the current
+        // inventory silently. Plan §3.4: silence is the default; only
+        // fire a notification on a change.
+        let _ = store.record_snapshot(&dg_win::now_iso8601_utc(), "watch", &after);
+        return ExitCode::SUCCESS;
+    };
+    let diff = dg_core::diff_snapshots(&prior, &after);
+    if diff.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let n_added = diff.iter().filter(|c| c.before.is_none() && c.after.is_some()).count();
+    let n_removed = diff.iter().filter(|c| c.before.is_some() && c.after.is_none()).count();
+    let n_changed = diff.iter().filter(|c| c.before.is_some() && c.after.is_some()).count();
+    let summary = format!(
+        "DriverGuard found {n_changed} driver version changes, {n_added} new devices, {n_removed} removed."
+    );
+    let detail_changes: Vec<serde_json::Value> = diff
+        .iter()
+        .map(|c| {
+            let kind = match (&c.before, &c.after) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "removed",
+                (Some(_), Some(_)) => "driver-changed",
+                _ => "unknown",
+            };
+            serde_json::json!({
+                "instance_id": c.instance_id,
+                "device_name": c.device_name,
+                "change": kind,
+            })
+        })
+        .collect();
+    let snap_id = match store.record_snapshot(&dg_win::now_iso8601_utc(), "watch", &after) {
+        Ok(id) => Some(id),
+        Err(_) => None,
+    };
+    let detail_json =
+        serde_json::to_string(&serde_json::json!({ "snapshot_id": snap_id, "changes": detail_changes }))
+            .unwrap_or_default();
+    let _ = store.record_event(
+        dg_core::EventKind::DriverChanged,
+        &summary,
+        "",
+        Some(&detail_json),
+    );
+    let _ = dg_win::system::notify_driver_changed(&summary);
+    ExitCode::SUCCESS
+}
+
+fn register_watch_cmd() -> ExitCode {
+    let exe = match dg_win::system::current_exe_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("could not determine own exe path: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match dg_win::system::register_watch_task(&exe) {
+        Ok(()) => {
+            println!("Registered DriverGuard Watch scheduled task (logon trigger).");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not register watch task: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn unregister_watch_cmd() -> ExitCode {
+    match dg_win::system::unregister_watch_task() {
+        Ok(()) => {
+            println!("Removed DriverGuard Watch scheduled task.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not unregister watch task: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn status_cmd() -> ExitCode {
