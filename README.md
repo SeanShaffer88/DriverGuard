@@ -56,6 +56,7 @@ driverguard status                 Show current policy state and active locks
 driverguard --watch                One headless driver-change check (used by the scheduled task)
 driverguard register-watch         Install the DriverGuard Watch scheduled task (logon trigger)
 driverguard unregister-watch       Remove the DriverGuard Watch scheduled task
+driverguard restore <folder>       Install all drivers from a backup folder (elevated, UAC prompt)
 ```
 
 The `backup` command asks for administrator approval the same way the
