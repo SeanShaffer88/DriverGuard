@@ -15,10 +15,8 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      # Temporarily disabled while we iterate on v0.2/v0.3 without a
-      # local toolchain; re-enabled before a release tag.
-      # - name: Format
-      #   run: cargo fmt --all -- --check
+      - name: Format
+        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
