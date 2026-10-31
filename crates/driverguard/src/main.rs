@@ -30,6 +30,8 @@ USAGE:
     driverguard register-watch        Register the DriverGuard Watch scheduled task
                                       (runs --watch at logon)
     driverguard unregister-watch      Remove the DriverGuard Watch scheduled task
+    driverguard restore <folder>      Install all drivers from a backup folder
+                                      (pnputil /add-driver /install, UAC prompt)
     driverguard --version             Print version
     driverguard --help                Show this help
 ";
@@ -66,6 +68,7 @@ fn main() -> ExitCode {
         Some("--watch") => watch_cmd(),
         Some("register-watch") => register_watch_cmd(),
         Some("unregister-watch") => unregister_watch_cmd(),
+        Some("restore") => restore_cmd(&args),
         Some(other) => {
             eprintln!("Unknown argument: {other}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -574,6 +577,47 @@ fn unregister_watch_cmd() -> ExitCode {
         }
         Err(e) => {
             eprintln!("could not unregister watch task: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn restore_cmd(args: &[String]) -> ExitCode {
+    let Some(folder) = args.get(1) else {
+        eprintln!("usage: driverguard restore <backup-folder>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let path = std::path::PathBuf::from(folder);
+    if !path.exists() {
+        eprintln!("backup folder not found: {}", path.display());
+        return ExitCode::FAILURE;
+    }
+    // Build a simple plan: create restore point, install from folder.
+    // Because this is a full-folder restore, we don't do lift/relock —
+    // leave that to the per-device history-restore flow.
+    let plan = dg_core::LockPlan {
+        create_restore_point: true,
+        description: format!("Restore drivers from backup {}", path.display()),
+        ops: vec![dg_core::PolicyOp::InstallDriver {
+            target: path.to_string_lossy().to_string(),
+        }],
+    };
+    match dg_win::elevate::run_apply_lock(&plan) {
+        Ok(msg) => {
+            println!("Restore completed. {msg}");
+            if let Ok(mut store) = dg_win::store::Store::open_default() {
+                let detail = serde_json::json!({ "folder": path.display().to_string() });
+                let _ = store.record_event(
+                    dg_core::EventKind::DriverRestored,
+                    &dg_win::now_iso8601_utc(),
+                    &format!("Restored drivers from backup {}", path.display()),
+                    Some(&detail.to_string()),
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("Restore failed: {e}");
             ExitCode::FAILURE
         }
     }
