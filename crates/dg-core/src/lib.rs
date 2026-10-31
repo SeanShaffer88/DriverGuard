@@ -192,25 +192,133 @@ pub struct PolicyState {
     pub deny_value_present: bool,
     /// Hardware IDs currently in the deny list, in policy order.
     pub denied_hardware_ids: Vec<String>,
+    /// The global "exclude drivers from Windows Update" toggle
+    /// (plan §3.3, lever 2): `ExcludeWUDriversInQualityUpdate` under
+    /// `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`.
+    pub wu_exclude_drivers: bool,
+    /// Whether the `ExcludeWUDriversInQualityUpdate` value existed
+    /// before DriverGuard touched it — again used to restore the
+    /// exact prior state on "unlock everything".
+    pub wu_exclude_present: bool,
 }
 
 /// One primitive policy mutation. A plan is an ordered list of these.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyOp {
     SetDenyEnabled(bool),
+    /// Write a numbered value in the `DenyDeviceIDs` subkey (append).
     AddDeniedHardwareId(String),
+    /// Delete the numbered value in the `DenyDeviceIDs` subkey (and
+    /// renumber later values to keep a contiguous 0-based list).
     RemoveDeniedHardwareId(String),
+    /// Toggle the global WU-driver-exclusion value (lever 2).
+    SetWuExcludeDrivers(bool),
+    /// Delete the `DenyDeviceIDs` subkey entirely (only used by
+    /// "unlock everything" when we were the ones who created it and
+    /// there are no foreign entries left).
+    DeleteDenySubkey,
+}
+
+/// A lock record stored in the database for one hardware ID that
+/// DriverGuard locked. It captures the policy state *as it was before
+/// we touched this ID* so that unlock restores the prior state
+/// faithfully (plan §1.1 principles 3 & 4, §3.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockRecord {
+    /// Hardware ID this record covers.
+    pub hardware_id: String,
+    /// Human-friendly device name the lock was applied to, for UI.
+    pub device_name: String,
+    /// Policy state at the moment before the lock was applied.
+    pub prior: PolicyState,
+    /// RFC 3339 UTC timestamp the lock was applied.
+    pub applied_at: String,
 }
 
 /// An ordered, minimal plan to mutate policy.
+///
+/// Plans are always produced against a read of the real registry state
+/// (plan §1.1, principle 6), applied by the elevated helper (§2.1),
+/// and verified by re-reading afterwards (§4). Every plan starts with
+/// a request for a system restore point when `create_restore_point`
+/// is true — the default for any operation that changes policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockPlan {
+    pub create_restore_point: bool,
+    /// Human-readable description for the restore point and the event log.
+    pub description: String,
     pub ops: Vec<PolicyOp>,
 }
 
 impl LockPlan {
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
+    }
+}
+
+/// Build a plan that locks the WU-driver-exclusion toggle (lever 2)
+/// to the requested state without touching the per-device deny list.
+/// Returns `None` when the toggle is already at the requested state.
+pub fn plan_set_wu_exclude(current: &PolicyState, enabled: bool) -> Option<LockPlan> {
+    if current.wu_exclude_drivers == enabled {
+        return None;
+    }
+    Some(LockPlan {
+        create_restore_point: true,
+        description: format!(
+            "{} drivers from Windows Quality Updates",
+            if enabled { "Exclude" } else { "Stop excluding" }
+        ),
+        ops: vec![PolicyOp::SetWuExcludeDrivers(enabled)],
+    })
+}
+
+/// Build an "unlock everything" plan: remove every hardware ID
+/// DriverGuard previously added, disable the deny list if we were the
+/// ones who enabled it, and (optionally) reset the WU toggle back to
+/// its state before us. The caller passes in the records it holds so
+/// we can distinguish our entries from foreign ones.
+pub fn plan_unlock_all(current: &PolicyState, our_records: &[LockRecord], reset_wu_toggle: bool) -> LockPlan {
+    let our_ids: Vec<String> = our_records
+        .iter()
+        .map(|r| r.hardware_id.clone())
+        .collect();
+    let mut ops: Vec<PolicyOp> = Vec::new();
+    let original_deny_enabled = our_records
+        .iter()
+        .map(|r| r.prior.deny_enabled)
+        .min() // if any prior state had it enabled, we do not turn it off
+        .unwrap_or(false);
+    for id in &our_ids {
+        if contains_id(&current.denied_hardware_ids, id) {
+            ops.push(PolicyOp::RemoveDeniedHardwareId(id.clone()));
+        }
+    }
+    let remaining_foreign: usize = current
+        .denied_hardware_ids
+        .iter()
+        .filter(|id| !our_ids.iter().any(|ours| ours.eq_ignore_ascii_case(id)))
+        .count();
+    if remaining_foreign == 0 && !original_deny_enabled && current.deny_enabled {
+        ops.push(PolicyOp::DeleteDenySubkey);
+        ops.push(PolicyOp::SetDenyEnabled(false));
+    }
+    if reset_wu_toggle {
+        // Find the oldest prior wu_exclude value across records —
+        // that is the state before DriverGuard ever touched it.
+        let original_wu = our_records
+            .iter()
+            .map(|r| r.prior.wu_exclude_drivers)
+            .next()
+            .unwrap_or(current.wu_exclude_drivers);
+        if original_wu != current.wu_exclude_drivers {
+            ops.push(PolicyOp::SetWuExcludeDrivers(original_wu));
+        }
+    }
+    LockPlan {
+        create_restore_point: true,
+        description: "Unlock all drivers locked by DriverGuard".to_owned(),
+        ops,
     }
 }
 
@@ -222,7 +330,8 @@ fn contains_id(ids: &[String], hardware_id: &str) -> bool {
 ///
 /// Minimal and append-only: entries already in the list (an admin's,
 /// another tool's) are never removed or reordered by a lock plan.
-pub fn plan_lock(current: &PolicyState, hardware_id: &str) -> LockPlan {
+/// The returned plan requests a system restore point (§1.1, principle 4).
+pub fn plan_lock(current: &PolicyState, hardware_id: &str, device_name: &str) -> LockPlan {
     let mut ops = Vec::new();
     if !current.deny_enabled {
         ops.push(PolicyOp::SetDenyEnabled(true));
@@ -230,7 +339,11 @@ pub fn plan_lock(current: &PolicyState, hardware_id: &str) -> LockPlan {
     if !contains_id(&current.denied_hardware_ids, hardware_id) {
         ops.push(PolicyOp::AddDeniedHardwareId(hardware_id.to_owned()));
     }
-    LockPlan { ops }
+    LockPlan {
+        create_restore_point: true,
+        description: format!("Lock driver for {device_name}"),
+        ops,
+    }
 }
 
 /// Plan unlocking one hardware ID that DriverGuard previously locked.
@@ -239,7 +352,12 @@ pub fn plan_lock(current: &PolicyState, hardware_id: &str) -> LockPlan {
 /// becomes empty **and** `originally_enabled` is false — i.e. DriverGuard
 /// restores the state it found, and never tears down a deny list that
 /// predates it.
-pub fn plan_unlock(current: &PolicyState, hardware_id: &str, originally_enabled: bool) -> LockPlan {
+pub fn plan_unlock(
+    current: &PolicyState,
+    hardware_id: &str,
+    originally_enabled: bool,
+    device_name: &str,
+) -> LockPlan {
     let mut ops = Vec::new();
     if contains_id(&current.denied_hardware_ids, hardware_id) {
         ops.push(PolicyOp::RemoveDeniedHardwareId(hardware_id.to_owned()));
@@ -250,9 +368,14 @@ pub fn plan_unlock(current: &PolicyState, hardware_id: &str, originally_enabled:
         .filter(|id| !id.eq_ignore_ascii_case(hardware_id))
         .count();
     if remaining == 0 && !originally_enabled && current.deny_enabled {
+        ops.push(PolicyOp::DeleteDenySubkey);
         ops.push(PolicyOp::SetDenyEnabled(false));
     }
-    LockPlan { ops }
+    LockPlan {
+        create_restore_point: true,
+        description: format!("Unlock driver for {device_name}"),
+        ops,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +389,12 @@ pub enum EventKind {
     Inventory,
     BackupCreated,
     BackupFailed,
+    LockApplied,
+    LockRemoved,
+    UnlockAll,
+    PolicyChanged,
+    RestorePointCreated,
+    RestoreFailed,
 }
 
 impl EventKind {
@@ -274,6 +403,12 @@ impl EventKind {
             EventKind::Inventory => "inventory",
             EventKind::BackupCreated => "backup-created",
             EventKind::BackupFailed => "backup-failed",
+            EventKind::LockApplied => "lock-applied",
+            EventKind::LockRemoved => "lock-removed",
+            EventKind::UnlockAll => "unlock-all",
+            EventKind::PolicyChanged => "policy-changed",
+            EventKind::RestorePointCreated => "restore-point-created",
+            EventKind::RestoreFailed => "restore-failed",
         }
     }
 
@@ -282,6 +417,12 @@ impl EventKind {
             "inventory" => Some(EventKind::Inventory),
             "backup-created" => Some(EventKind::BackupCreated),
             "backup-failed" => Some(EventKind::BackupFailed),
+            "lock-applied" => Some(EventKind::LockApplied),
+            "lock-removed" => Some(EventKind::LockRemoved),
+            "unlock-all" => Some(EventKind::UnlockAll),
+            "policy-changed" => Some(EventKind::PolicyChanged),
+            "restore-point-created" => Some(EventKind::RestorePointCreated),
+            "restore-failed" => Some(EventKind::RestoreFailed),
             _ => None,
         }
     }
@@ -513,7 +654,8 @@ mod tests {
     #[test]
     fn lock_plan_on_clean_policy_enables_and_adds() {
         let state = PolicyState::default();
-        let plan = plan_lock(&state, "PCI\\VEN_1002&DEV_73FF");
+        let plan = plan_lock(&state, "PCI\\VEN_1002&DEV_73FF", "Test GPU");
+        assert!(plan.create_restore_point);
         assert_eq!(
             plan.ops,
             vec![
@@ -529,8 +671,9 @@ mod tests {
             deny_enabled: true,
             deny_value_present: true,
             denied_hardware_ids: vec!["pci\\ven_1002&dev_73ff".to_owned()],
+            ..Default::default()
         };
-        assert!(plan_lock(&state, "PCI\\VEN_1002&DEV_73FF").is_empty());
+        assert!(plan_lock(&state, "PCI\\VEN_1002&DEV_73FF", "Test GPU").is_empty());
     }
 
     #[test]
@@ -539,8 +682,9 @@ mod tests {
             deny_enabled: true,
             deny_value_present: true,
             denied_hardware_ids: vec!["USB\\VID_1234&PID_5678".to_owned()],
+            ..Default::default()
         };
-        let plan = plan_lock(&state, "PCI\\VEN_1002&DEV_73FF");
+        let plan = plan_lock(&state, "PCI\\VEN_1002&DEV_73FF", "Test GPU");
         assert!(plan
             .ops
             .iter()
@@ -553,12 +697,15 @@ mod tests {
             deny_enabled: true,
             deny_value_present: true,
             denied_hardware_ids: vec!["PCI\\VEN_1002&DEV_73FF".to_owned()],
+            ..Default::default()
         };
-        let plan = plan_unlock(&state, "PCI\\VEN_1002&DEV_73FF", false);
+        let plan = plan_unlock(&state, "PCI\\VEN_1002&DEV_73FF", false, "Test GPU");
+        assert!(plan.create_restore_point);
         assert_eq!(
             plan.ops,
             vec![
                 PolicyOp::RemoveDeniedHardwareId("PCI\\VEN_1002&DEV_73FF".to_owned()),
+                PolicyOp::DeleteDenySubkey,
                 PolicyOp::SetDenyEnabled(false),
             ]
         );
@@ -570,14 +717,83 @@ mod tests {
             deny_enabled: true,
             deny_value_present: true,
             denied_hardware_ids: vec!["PCI\\VEN_1002&DEV_73FF".to_owned()],
+            ..Default::default()
         };
-        let plan = plan_unlock(&state, "PCI\\VEN_1002&DEV_73FF", true);
+        let plan = plan_unlock(&state, "PCI\\VEN_1002&DEV_73FF", true, "Test GPU");
         assert_eq!(
             plan.ops,
             vec![PolicyOp::RemoveDeniedHardwareId(
                 "PCI\\VEN_1002&DEV_73FF".to_owned()
             )]
         );
+    }
+
+    fn sample_record(hw: &str) -> LockRecord {
+        LockRecord {
+            hardware_id: hw.to_owned(),
+            device_name: "Test GPU".to_owned(),
+            prior: PolicyState::default(),
+            applied_at: "2026-10-31T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn unlock_all_removes_only_our_entries_and_deletes_empty_key() {
+        let current = PolicyState {
+            deny_enabled: true,
+            deny_value_present: true,
+            denied_hardware_ids: vec![
+                "PCI\\VEN_1002&DEV_73FF".to_owned(),
+                "USB\\VID_1234&PID_5678".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let records = vec![sample_record("PCI\\VEN_1002&DEV_73FF")];
+        let plan = plan_unlock_all(&current, &records, false);
+        // Only our ID is removed; foreign USB entry is left in place.
+        assert!(plan.ops.contains(&PolicyOp::RemoveDeniedHardwareId(
+            "PCI\\VEN_1002&DEV_73FF".to_owned()
+        )));
+        assert!(!plan.ops.contains(&PolicyOp::RemoveDeniedHardwareId(
+            "USB\\VID_1234&PID_5678".to_owned()
+        )));
+        // Because a foreign entry remains, deny list stays enabled and
+        // the subkey is NOT deleted.
+        assert!(!plan.ops.contains(&PolicyOp::DeleteDenySubkey));
+        assert!(!plan
+            .ops
+            .contains(&PolicyOp::SetDenyEnabled(false)));
+    }
+
+    #[test]
+    fn unlock_all_clears_key_when_no_foreign_entries_remain() {
+        let current = PolicyState {
+            deny_enabled: true,
+            deny_value_present: true,
+            denied_hardware_ids: vec!["PCI\\VEN_1002&DEV_73FF".to_owned()],
+            ..Default::default()
+        };
+        let records = vec![sample_record("PCI\\VEN_1002&DEV_73FF")];
+        let plan = plan_unlock_all(&current, &records, true);
+        assert!(plan.ops.contains(&PolicyOp::DeleteDenySubkey));
+        assert!(plan.ops.contains(&PolicyOp::SetDenyEnabled(false)));
+    }
+
+    #[test]
+    fn set_wu_exclude_is_noop_when_already_set() {
+        let state = PolicyState {
+            wu_exclude_drivers: true,
+            ..Default::default()
+        };
+        assert!(plan_set_wu_exclude(&state, true).is_none());
+    }
+
+    #[test]
+    fn set_wu_exclude_plans_toggle() {
+        let state = PolicyState::default();
+        let plan = plan_set_wu_exclude(&state, true).unwrap();
+        assert!(plan.create_restore_point);
+        assert_eq!(plan.ops, vec![PolicyOp::SetWuExcludeDrivers(true)]);
     }
 
     #[test]

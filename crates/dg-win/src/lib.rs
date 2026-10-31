@@ -55,6 +55,7 @@ pub type Result<T> = std::result::Result<T, WinError>;
 
 pub mod elevate;
 pub mod gui;
+pub mod helper;
 
 /// Current UTC time as an RFC 3339 string, for manifest timestamps.
 pub fn now_iso8601_utc() -> String {
@@ -325,24 +326,411 @@ pub mod inventory {
 /// Device Installation Restrictions policy (plan §3.3).
 ///
 /// Reads and writes
-/// `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`.
+/// `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`
+/// (per-device deny list) and
+/// `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`
+/// (`ExcludeWUDriversInQualityUpdate`, the global lever 2 toggle).
+///
 /// Only the operations in [`dg_core::PolicyOp`] are supported — there is no
-/// generic registry-write path, and the retroactive-restriction value is
-/// never written by this crate.
+/// generic registry-write path, and the retroactive-restriction value
+/// (`DenyDeviceIDsRetroactive`) is never written by this crate.
+/// Device Installation Restrictions policy (plan §3.3).
+///
+/// Reads and writes
+/// `HKLM\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions`
+/// (per-device deny list) and
+/// `HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate`
+/// (`ExcludeWUDriversInQualityUpdate`, the global lever 2 toggle).
+///
+/// Only the operations in [`dg_core::PolicyOp`] are supported — there is no
+/// generic registry-write path, and the retroactive-restriction value
+/// (`DenyDeviceIDsRetroactive`) is never written by this crate.
 pub mod policy {
     use super::{Result, WinError};
-    use dg_core::{LockPlan, PolicyState};
+    use dg_core::{LockPlan, PolicyOp, PolicyState};
 
     /// Read the current policy state. The registry is the source of truth;
     /// the app's database is only a cache (plan §1.1, principle 6).
     pub fn read_state() -> Result<PolicyState> {
-        Err(WinError::NotImplemented)
+        #[cfg(target_os = "windows")]
+        {
+            imp::read_state()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Err(WinError::NotImplemented)
+        }
     }
 
     /// Apply a lock/unlock plan produced by `dg-core`, verifying by
     /// re-reading after the write. Requires elevation (elevated helper).
-    pub fn apply_plan(_plan: &LockPlan) -> Result<()> {
-        Err(WinError::NotImplemented)
+    pub fn apply_plan(plan: &LockPlan) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            imp::apply_plan(plan)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = plan;
+            Err(WinError::NotImplemented)
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    mod imp {
+        use super::super::{Result, WinError};
+        use super::{LockPlan, PolicyOp, PolicyState};
+        use std::ffi::c_void;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, WIN32_ERROR};
+        use windows::Win32::System::Registry::{
+            RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegEnumValueW,
+            RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+            KEY_WRITE, REG_DWORD, REG_SZ, RRF_RT_DWORD, RRF_RT_REG_SZ,
+        };
+
+        const RESTRICTIONS_KEY: &str =
+            "SOFTWARE\\Policies\\Microsoft\\Windows\\DeviceInstall\\Restrictions";
+        const DENY_SUBKEY: &str = "DenyDeviceIDs";
+        const WU_KEY: &str = "SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate";
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        /// Closes a key; safe to call on a null/default HKEY.
+        fn close(h: HKEY) {
+            unsafe { let _ = RegCloseKey(h); }
+        }
+
+        /// RAII key closer.
+        struct Key(Option<HKEY>);
+        impl Key {
+            fn none() -> Self { Key(None) }
+            fn set(&mut self, h: HKEY) { self.0 = Some(h); }
+            fn get(&self) -> Option<HKEY> { self.0 }
+        }
+        impl Drop for Key { fn drop(&mut self) { if let Some(h) = self.0 { close(h); } } }
+
+        fn api_err(code: u32, msg: &'static str) -> WinError {
+            WinError::Api { code, message: msg.to_owned() }
+        }
+
+        fn open_key(path_pcw: PCWSTR, access: u32) -> Result<Option<HKEY>> {
+            let mut h = HKEY::default();
+            let st = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_pcw, 0, access, &mut h) };
+            match WIN32_ERROR(st) {
+                ERROR_FILE_NOT_FOUND => Ok(None),
+                WIN32_ERROR(0) => Ok(Some(h)),
+                other => Err(api_err(other.0, "RegOpenKeyExW failed")),
+            }
+        }
+
+        fn create_key(path_pcw: PCWSTR) -> Result<HKEY> {
+            let mut h = HKEY::default();
+            let mut disp = 0u32;
+            let st = unsafe {
+                RegCreateKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    path_pcw,
+                    0,
+                    PCWSTR::null(),
+                    0,
+                    KEY_WRITE,
+                    std::ptr::null(),
+                    &mut h,
+                    Some(&mut disp),
+                )
+            };
+            if WIN32_ERROR(st) != WIN32_ERROR(0) {
+                return Err(api_err(st, "RegCreateKeyExW failed"));
+            }
+            Ok(h)
+        }
+
+        fn create_subkey(parent: HKEY, sub_pcw: PCWSTR) -> Result<HKEY> {
+            let mut h = HKEY::default();
+            let mut disp = 0u32;
+            let st = unsafe {
+                RegCreateKeyExW(
+                    parent,
+                    sub_pcw,
+                    0,
+                    PCWSTR::null(),
+                    0,
+                    KEY_WRITE,
+                    std::ptr::null(),
+                    &mut h,
+                    Some(&mut disp),
+                )
+            };
+            if WIN32_ERROR(st) != WIN32_ERROR(0) {
+                return Err(api_err(st, "RegCreateKeyExW (subkey) failed"));
+            }
+            Ok(h)
+        }
+
+        fn read_dword(h: HKEY, name_pcw: PCWSTR) -> Result<Option<u32>> {
+            let mut v: u32 = 0;
+            let mut sz = std::mem::size_of::<u32>() as u32;
+            let mut ty = 0u32;
+            let st = unsafe {
+                RegGetValueW(
+                    h,
+                    PCWSTR::null(),
+                    name_pcw,
+                    RRF_RT_DWORD,
+                    Some(&mut ty),
+                    Some(&mut v as *mut u32 as *mut c_void),
+                    Some(&mut sz),
+                )
+            };
+            match WIN32_ERROR(st) {
+                ERROR_FILE_NOT_FOUND => Ok(None),
+                WIN32_ERROR(0) => Ok(Some(v)),
+                other => Err(api_err(other.0, "RegGetValueW (DWORD) failed")),
+            }
+        }
+
+        /// Read numbered REG_SZ values under the `DenyDeviceIDs` subkey,
+        /// returned in numeric order.
+        fn read_denied_ids(restrictions_h: HKEY) -> Result<Vec<String>> {
+            let sub_w = wide(DENY_SUBKEY);
+            let mut sub = HKEY::default();
+            let st = unsafe {
+                RegOpenKeyExW(restrictions_h, PCWSTR(sub_w.as_ptr()), 0, KEY_READ, &mut sub)
+            };
+            match WIN32_ERROR(st) {
+                ERROR_FILE_NOT_FOUND => return Ok(Vec::new()),
+                WIN32_ERROR(0) => {}
+                other => return Err(api_err(other.0, "RegOpenKeyExW (DenyDeviceIDs) failed")),
+            }
+            let _guard = Key(Some(sub));
+            let mut pairs: Vec<(u32, String)> = Vec::new();
+            for idx in 0u32.. {
+                let mut name_buf = [0u16; 512];
+                let mut name_len = name_buf.len() as u32;
+                let st = unsafe {
+                    RegEnumValueW(
+                        sub, idx,
+                        windows::core::PWSTR(name_buf.as_mut_ptr()),
+                        &mut name_len,
+                        std::ptr::null(), std::ptr::null_mut(),
+                        std::ptr::null_mut(), std::ptr::null_mut(),
+                    )
+                };
+                if WIN32_ERROR(st) == ERROR_NO_MORE_ITEMS { break; }
+                if WIN32_ERROR(st) != WIN32_ERROR(0) {
+                    return Err(api_err(st, "RegEnumValueW failed"));
+                }
+                let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
+                let Ok(num) = name.parse::<u32>() else { continue };
+                let mut data = [0u16; 1024];
+                let mut bytes = (data.len() * 2) as u32;
+                let mut ty = 0u32;
+                let name_pcw = PCWSTR(name_buf.as_ptr());
+                let st2 = unsafe {
+                    RegGetValueW(
+                        sub, name_pcw, PCWSTR::null(),
+                        RRF_RT_REG_SZ, Some(&mut ty),
+                        Some(data.as_mut_ptr() as *mut c_void),
+                        Some(&mut bytes),
+                    )
+                };
+                if WIN32_ERROR(st2) != WIN32_ERROR(0) { continue; }
+                let n_chars = (bytes / 2) as usize;
+                let end = data[..n_chars].iter().position(|&u| u == 0).unwrap_or(n_chars);
+                pairs.push((num, String::from_utf16_lossy(&data[..end])));
+            }
+            pairs.sort_by_key(|(n, _)| *n);
+            Ok(pairs.into_iter().map(|(_, s)| s).collect())
+        }
+
+        fn write_dword(h: HKEY, name_pcw: PCWSTR, v: u32) -> Result<()> {
+            let bytes = v.to_le_bytes();
+            let st = unsafe { RegSetValueExW(h, name_pcw, 0, REG_DWORD, Some(&bytes)) };
+            if WIN32_ERROR(st) != WIN32_ERROR(0) {
+                return Err(api_err(st, "RegSetValueExW (DWORD) failed"));
+            }
+            Ok(())
+        }
+
+        fn delete_val(h: HKEY, name_pcw: PCWSTR) -> Result<()> {
+            let st = unsafe { RegDeleteValueW(h, name_pcw) };
+            if WIN32_ERROR(st) != WIN32_ERROR(0) && WIN32_ERROR(st) != ERROR_FILE_NOT_FOUND {
+                return Err(api_err(st, "RegDeleteValueW failed"));
+            }
+            Ok(())
+        }
+
+        fn write_sz(h: HKEY, name_pcw: PCWSTR, text: &str) -> Result<()> {
+            let data: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
+            };
+            let st = unsafe { RegSetValueExW(h, name_pcw, 0, REG_SZ, Some(bytes)) };
+            if WIN32_ERROR(st) != WIN32_ERROR(0) {
+                return Err(api_err(st, "RegSetValueExW (SZ) failed"));
+            }
+            Ok(())
+        }
+
+        /// Rewrite the numbered DenyDeviceIDs subkey from `entries`. If
+        /// `entries` is empty the subkey is deleted entirely.
+        fn rewrite_deny_list(parent: HKEY, entries: &[String]) -> Result<()> {
+            let sub_w = wide(DENY_SUBKEY);
+            // Open-or-create the subkey.
+            let mut sub = HKEY::default();
+            let mut disp = 0u32;
+            let create_st = unsafe {
+                RegCreateKeyExW(
+                    parent, PCWSTR(sub_w.as_ptr()), 0, PCWSTR::null(), 0,
+                    KEY_WRITE, std::ptr::null(), &mut sub, Some(&mut disp),
+                )
+            };
+            if WIN32_ERROR(create_st) != WIN32_ERROR(0) {
+                return Err(api_err(create_st, "RegCreateKeyExW (DenyDeviceIDs subkey) failed"));
+            }
+            let _g = Key(Some(sub));
+            // Wipe existing numbered values.
+            for n in 0u32..4096 {
+                let nw = wide(&n.to_string());
+                let st = unsafe { RegDeleteValueW(sub, PCWSTR(nw.as_ptr())) };
+                if WIN32_ERROR(st) == ERROR_FILE_NOT_FOUND { break; }
+            }
+            if entries.is_empty() {
+                // Close the subkey first, then delete it.
+                drop(_g);
+                let st = unsafe { RegDeleteKeyW(parent, PCWSTR(sub_w.as_ptr())) };
+                if WIN32_ERROR(st) != WIN32_ERROR(0) && WIN32_ERROR(st) != ERROR_FILE_NOT_FOUND {
+                    return Err(api_err(st, "RegDeleteKeyW (DenyDeviceIDs subkey) failed"));
+                }
+                return Ok(());
+            }
+            for (i, e) in entries.iter().enumerate() {
+                let nw = wide(&i.to_string());
+                write_sz(sub, PCWSTR(nw.as_ptr()), e)?;
+            }
+            Ok(())
+        }
+
+        pub(super) fn read_state() -> Result<PolicyState> {
+            let mut state = PolicyState::default();
+            let r_w = wide(RESTRICTIONS_KEY);
+            let wu_w = wide(WU_KEY);
+            if let Some(h) = open_key(PCWSTR(r_w.as_ptr()), KEY_READ)? {
+                let _g = Key(Some(h));
+                if let Some(v) = read_dword(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))? {
+                    state.deny_enabled = v != 0;
+                    state.deny_value_present = true;
+                }
+                state.denied_hardware_ids = read_denied_ids(h)?;
+            }
+            if let Some(h) = open_key(PCWSTR(wu_w.as_ptr()), KEY_READ)? {
+                let _g = Key(Some(h));
+                if let Some(v) = read_dword(h, PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()))? {
+                    state.wu_exclude_drivers = v != 0;
+                    state.wu_exclude_present = true;
+                }
+            }
+            Ok(state)
+        }
+
+        pub(super) fn apply_plan(plan: &LockPlan) -> Result<()> {
+            // Restore point is the caller's (helper_main) responsibility
+            // before apply_plan is invoked; we just mutate policy.
+
+            // Compute the target deny list / WU toggle by folding the
+            // plan ops into the current read.
+            let current = read_state()?;
+            let mut denied = current.denied_hardware_ids.clone();
+            let mut wu = current.wu_exclude_drivers;
+            let mut deny_enabled = current.deny_enabled;
+            for op in &plan.ops {
+                match op {
+                    PolicyOp::SetDenyEnabled(on) => deny_enabled = *on,
+                    PolicyOp::AddDeniedHardwareId(id) => {
+                        if !denied.iter().any(|e| e.eq_ignore_ascii_case(id)) {
+                            denied.push(id.clone());
+                        }
+                    }
+                    PolicyOp::RemoveDeniedHardwareId(id) => {
+                        denied.retain(|e| !e.eq_ignore_ascii_case(id));
+                    }
+                    PolicyOp::SetWuExcludeDrivers(on) => wu = *on,
+                    PolicyOp::DeleteDenySubkey => {
+                        denied.clear();
+                        deny_enabled = false;
+                    }
+                }
+            }
+
+            let touches_restrictions = plan.ops.iter().any(|o| {
+                matches!(
+                    o,
+                    PolicyOp::SetDenyEnabled(_)
+                        | PolicyOp::AddDeniedHardwareId(_)
+                        | PolicyOp::RemoveDeniedHardwareId(_)
+                        | PolicyOp::DeleteDenySubkey
+                )
+            });
+            let touches_wu = plan
+                .ops
+                .iter()
+                .any(|o| matches!(o, PolicyOp::SetWuExcludeDrivers(_)));
+
+            let mut r_key = Key::none();
+            let mut wu_key = Key::none();
+
+            if touches_restrictions {
+                let r_w = wide(RESTRICTIONS_KEY);
+                let h = create_key(PCWSTR(r_w.as_ptr()))?;
+                r_key.set(h);
+                write_dword(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()), if deny_enabled { 1 } else { 0 })?;
+                rewrite_deny_list(h, &denied)?;
+                if denied.is_empty() && !deny_enabled && !current.deny_value_present {
+                    // Restore the "value was never there" state by
+                    // deleting the DWORD we wrote.
+                    delete_val(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))?;
+                }
+            }
+            if touches_wu {
+                let w_w = wide(WU_KEY);
+                let h = create_key(PCWSTR(w_w.as_ptr()))?;
+                wu_key.set(h);
+                write_dword(
+                    h,
+                    PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()),
+                    if wu { 1 } else { 0 },
+                )?;
+            }
+            // Verification pass: re-read and sanity-check that the
+            // values we asked for are present.
+            let after = read_state()?;
+            if touches_restrictions {
+                let mut a = after.denied_hardware_ids.clone();
+                a.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
+                let mut d = denied.clone();
+                d.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
+                if a != d {
+                    return Err(WinError::Verification(
+                        "policy apply did not produce the expected deny list".to_owned(),
+                    ));
+                }
+                if after.deny_enabled != deny_enabled {
+                    return Err(WinError::Verification(
+                        "policy apply did not set DenyDeviceIDs DWORD as expected".to_owned(),
+                    ));
+                }
+            }
+            if touches_wu && after.wu_exclude_drivers != wu {
+                return Err(WinError::Verification(
+                    "policy apply did not set ExcludeWUDriversInQualityUpdate as expected"
+                        .to_owned(),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -729,7 +1117,7 @@ pub mod store {
     use super::{Path, Result, WinError};
     use dg_core::{
         BackupManifest, Device, DeviceSnapshot, DriverDate, DriverInfo, DriverVersion, Event,
-        EventKind, Snapshot,
+        EventKind, LockRecord, PolicyState, Snapshot,
     };
     use rusqlite::{params, Connection, OptionalExtension};
     use std::path::PathBuf;
@@ -773,6 +1161,18 @@ CREATE INDEX IF NOT EXISTS events_recorded_at_idx ON events(recorded_at DESC);
 PRAGMA user_version = 2;
 ";
 
+    // v3 adds the locks table so we can faithfully restore policy state
+    // on a per-device unlock or unlock-everything (plan §2.3).
+    const SCHEMA_V3: &str = "\
+CREATE TABLE IF NOT EXISTS locks (
+    hardware_id TEXT PRIMARY KEY,
+    device_name TEXT NOT NULL,
+    prior_state_json TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
+PRAGMA user_version = 3;
+";
+
     /// The application data directory: `%LOCALAPPDATA%\DriverGuard`.
     pub fn data_dir() -> Result<PathBuf> {
         let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
@@ -808,14 +1208,19 @@ PRAGMA user_version = 2;
                 0 => {
                     conn.execute_batch(SCHEMA_V1)?;
                     conn.execute_batch(SCHEMA_V2)?;
+                    conn.execute_batch(SCHEMA_V3)?;
                 }
                 1 => {
                     conn.execute_batch(SCHEMA_V2)?;
+                    conn.execute_batch(SCHEMA_V3)?;
                 }
-                2 => {}
+                2 => {
+                    conn.execute_batch(SCHEMA_V3)?;
+                }
+                3 => {}
                 other => {
                     return Err(WinError::DataDir(format!(
-                        "unsupported database schema version {other} (this build understands up to 2)"
+                        "unsupported database schema version {other} (this build understands up to 3)"
                     )));
                 }
             }
@@ -1016,6 +1421,91 @@ PRAGMA user_version = 2;
                 params![kind.as_tag(), recorded_at, summary, detail_json],
             )?;
             Ok(self.conn.last_insert_rowid())
+        }
+
+        /// Record a per-device lock. Replaces any prior record for the
+        /// same hardware ID (e.g. re-locking after an unlock).
+        pub fn record_lock(&self, record: &LockRecord) -> Result<()> {
+            let prior_json = serde_json::to_string(&record.prior).map_err(|e| WinError::Api {
+                code: 0,
+                message: format!("prior-state serialization failed: {e}"),
+            })?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO locks (hardware_id, device_name, prior_state_json, applied_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    record.hardware_id,
+                    record.device_name,
+                    prior_json,
+                    record.applied_at,
+                ],
+            )?;
+            Ok(())
+        }
+
+        /// Remove a lock record for the given hardware ID (after unlock).
+        pub fn remove_lock(&self, hardware_id: &str) -> Result<()> {
+            self.conn.execute(
+                "DELETE FROM locks WHERE hardware_id = ?1",
+                rusqlite::params![hardware_id],
+            )?;
+            Ok(())
+        }
+
+        /// All lock records, in hardware-id order.
+        pub fn list_locks(&self) -> Result<Vec<LockRecord>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT hardware_id, device_name, prior_state_json, applied_at
+                 FROM locks ORDER BY hardware_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (hw, name, prior_json, at) = row?;
+                let prior: PolicyState = serde_json::from_str(&prior_json).map_err(|e| {
+                    WinError::Api { code: 0, message: format!("corrupt lock prior_state_json: {e}") }
+                })?;
+                out.push(LockRecord {
+                    hardware_id: hw,
+                    device_name: name,
+                    prior,
+                    applied_at: at,
+                });
+            }
+            Ok(out)
+        }
+
+        /// Look up one lock record by hardware ID.
+        pub fn get_lock(&self, hardware_id: &str) -> Result<Option<LockRecord>> {
+            let mut stmt = self.conn.prepare(
+                "SELECT hardware_id, device_name, prior_state_json, applied_at
+                 FROM locks WHERE hardware_id = ?1",
+            )?;
+            let row = stmt.query_row(rusqlite::params![hardware_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            });
+            match row {
+                Ok((hw, name, prior_json, at)) => {
+                    let prior: PolicyState = serde_json::from_str(&prior_json).map_err(|e| {
+                        WinError::Api { code: 0, message: format!("corrupt lock prior_state_json: {e}") }
+                    })?;
+                    Ok(Some(LockRecord { hardware_id: hw, device_name: name, prior, applied_at: at }))
+                }
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
         }
 
         /// Recent events, newest first, up to `limit`.
@@ -1259,8 +1749,88 @@ pub mod system {
 
     /// Create a system restore point before a policy-changing operation
     /// (plan §1.1, principle 4). Requires elevation (elevated helper).
-    pub fn create_restore_point(_description: &str) -> Result<()> {
-        Err(WinError::NotImplemented)
+    ///
+    /// On Windows this calls `SRSetRestorePointW` with
+    /// `APPLICATION_INSTALL | BEGIN_SYSTEM_CHANGE`, which is the
+    /// documented sequence for "an application is about to make changes
+    /// the user might want to undo". If System Restore is disabled the
+    /// call returns an error — callers surface this to the user for an
+    /// explicit acknowledgement before proceeding, per plan §1.1.
+    pub fn create_restore_point(description: &str) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        {
+            imp::create_restore_point(description)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = description;
+            Err(WinError::NotImplemented)
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    mod imp {
+        use super::super::{Result, WinError};
+        use std::ffi::c_long;
+
+        // SRSetRestorePoint lives in srclient.dll and is exposed with
+        // the stdcall convention. These constants match the values in
+        // srrestoreptapi.h from the Windows SDK.
+        const BEGIN_SYSTEM_CHANGE: u32 = 0x0001;
+        const APPLICATION_INSTALL: u32 = 0x0000;
+        // MODIFY_SETTINGS would be a more accurate event type for a
+        // policy change, but APPLICATION_INSTALL is what every published
+        // PowerShell/Win32 sample uses for a generic "take a checkpoint"
+        // operation, and it produces a normal restore point in System
+        // Restore UI.
+
+        #[repr(C)]
+        struct RestorePointInfoW {
+            dw_event_type: u32,
+            dw_restore_pt_type: u32,
+            sz_description: [u16; 256],
+        }
+
+        #[link(name = "srclient")]
+        extern "system" {
+            fn SRSetRestorePointW(
+                p_smgr_status: *mut RestorePointInfoW,
+                p_status: *mut c_long,
+            ) -> i32; // BOOL as i32
+        }
+
+        pub(super) fn create_restore_point(description: &str) -> Result<()> {
+            let mut info = RestorePointInfoW {
+                dw_event_type: BEGIN_SYSTEM_CHANGE,
+                dw_restore_pt_type: APPLICATION_INSTALL,
+                sz_description: [0u16; 256],
+            };
+            let mut written = 0usize;
+            for (i, u) in description.encode_utf16().take(255).enumerate() {
+                info.sz_description[i] = u;
+                written = i + 1;
+            }
+            info.sz_description[written] = 0;
+            let mut seq: c_long = 0;
+            // SAFETY: info and seq are live, stack-allocated out args;
+            // SRSetRestorePointW does not retain them past the call.
+            let ok = unsafe { SRSetRestorePointW(&mut info, &mut seq) };
+            if ok == 0 {
+                // Returns FALSE (0) on error; the STAT_* codes in
+                // seq distinguish "service disabled" from "cancelled".
+                // We surface the numeric code; the UI uses it to give
+                // the user a clear message.
+                Err(WinError::Api {
+                    code: seq as u32,
+                    message: format!(
+                        "could not create a system restore point (status {seq:#x}). \
+                         System Restore may be disabled."
+                    ),
+                })
+            } else {
+                Ok(())
+            }
+        }
     }
 
     /// Register the `DriverGuard Watch` scheduled task (logon + daily,

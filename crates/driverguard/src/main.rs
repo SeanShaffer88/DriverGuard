@@ -11,17 +11,24 @@ const USAGE: &str = "\
 DriverGuard — keep the drivers you chose.
 
 USAGE:
-    driverguard                     Launch the Devices window
-    driverguard inventory           Print the device/driver inventory as JSON
-    driverguard backup <folder>     Back up all third-party driver packages
-                                    into a new folder, with a verified manifest
-                                    (asks for administrator approval when needed)
+    driverguard                       Launch the Devices window
+    driverguard inventory             Print the device/driver inventory as JSON
+    driverguard backup <folder>       Back up all third-party driver packages
+                                      into a new folder, with a verified manifest
+                                      (asks for administrator approval when needed)
     driverguard verify-backup <folder>
-                                    Verify a backup folder against its manifest
-    driverguard history             Show recorded snapshots and backups
-    driverguard --watch             Run one headless driver-change check (planned, v0.3)
-    driverguard --version           Print version
-    driverguard --help              Show this help
+                                      Verify a backup folder against its manifest
+    driverguard history               Show recorded snapshots, backups, and events
+    driverguard lock <instance-id>    Lock the driver for a device (asks for approval)
+    driverguard unlock <instance-id>  Unlock one device driver
+    driverguard unlock-all            Remove all locks placed by DriverGuard
+    driverguard exclude-wu-drivers <on|off>
+                                      Toggle the global 'exclude drivers from Windows
+                                      Quality Updates' policy
+    driverguard status                Print current policy state and active locks
+    driverguard --watch               Run one headless driver-change check (planned, v0.3)
+    driverguard --version             Print version
+    driverguard --help                Show this help
 ";
 
 fn main() -> ExitCode {
@@ -48,6 +55,11 @@ fn main() -> ExitCode {
         Some("backup") => backup_cmd(&args),
         Some("verify-backup") => verify_backup_cmd(&args),
         Some("history") => history_cmd(),
+        Some("lock") => lock_cmd(&args),
+        Some("unlock") => unlock_cmd(&args),
+        Some("unlock-all") => unlock_all_cmd(),
+        Some("exclude-wu-drivers") => exclude_wu_cmd(&args),
+        Some("status") => status_cmd(),
         Some("--watch") => {
             eprintln!("--watch is not implemented yet (planned for v0.3).");
             ExitCode::SUCCESS
@@ -225,6 +237,8 @@ fn history_report() -> Result<String, dg_win::WinError> {
     let latest = store.latest_snapshot()?;
     let backups = store.list_backups()?;
     let events = store.list_events(50)?;
+    let locks = store.list_locks()?;
+    let policy = dg_win::policy::read_state().unwrap_or_default();
     let mut out = String::from("DriverGuard history\n");
     out.push_str(&format!("  snapshots recorded: {count}\n"));
     match &latest {
@@ -236,6 +250,22 @@ fn history_report() -> Result<String, dg_win::WinError> {
         }
         None => out.push_str("  latest snapshot: none\n"),
     }
+    out.push_str(&format!("  active locks: {}\n", locks.len()));
+    for lr in &locks {
+        out.push_str(&format!(
+            "    {} ({}) since {}\n",
+            lr.device_name, lr.hardware_id, lr.applied_at
+        ));
+    }
+    out.push_str(&format!(
+        "  per-device deny list: {} ({} entries)\n",
+        if policy.deny_enabled { "enabled" } else { "disabled" },
+        policy.denied_hardware_ids.len()
+    ));
+    out.push_str(&format!(
+        "  exclude drivers from Windows Quality Updates: {}\n",
+        if policy.wu_exclude_drivers { "on" } else { "off" }
+    ));
     out.push_str(&format!("  backups: {}\n", backups.len()));
     for (folder, manifest) in &backups {
         out.push_str(&format!(
@@ -258,4 +288,227 @@ fn history_report() -> Result<String, dg_win::WinError> {
         }
     }
     Ok(out.trim_end().to_owned())
+}
+
+// ---- v0.2 lock commands --------------------------------------------------
+
+fn find_device_by_instance<'a>(
+    snap: &'a dg_core::Snapshot,
+    instance_id: &str,
+) -> Option<&'a dg_core::DeviceSnapshot> {
+    snap.devices.iter().find(|d| {
+        d.device.instance_id.eq_ignore_ascii_case(instance_id)
+            || d.device.name.eq_ignore_ascii_case(instance_id)
+    })
+}
+
+fn pick_hardware_id(ds: &dg_core::DeviceSnapshot) -> Option<String> {
+    // Pick the most specific hardware ID (usually the first enumerated
+    // one is the PCI/USB hardware match).
+    ds.device.hardware_ids.first().cloned()
+}
+
+fn lock_cmd(args: &[String]) -> ExitCode {
+    let Some(instance_id) = args.get(1) else {
+        eprintln!("usage: driverguard lock <device-instance-id>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    with_elevated_lock(|| -> Result<(String, String), String> {
+        let devices = dg_win::inventory::snapshot().map_err(|e| e.to_string())?;
+        let snap = dg_core::Snapshot { devices };
+        let ds = find_device_by_instance(&snap, instance_id)
+            .ok_or_else(|| format!("no device with instance id '{instance_id}'"))?;
+        let hw = pick_hardware_id(ds).ok_or_else(|| "device has no hardware IDs to lock".to_string())?;
+        let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
+        let plan = dg_core::plan_lock(&current, &hw, &ds.device.name);
+        if plan.is_empty() {
+            return Ok((hw, format!("{} is already locked.", ds.device.name)));
+        }
+        let msg = dg_win::elevate::run_apply_lock(&plan).map_err(|e| e.to_string())?;
+        let now = dg_win::now_iso8601_utc();
+        let record = dg_core::LockRecord {
+            hardware_id: hw.clone(),
+            device_name: ds.device.name.clone(),
+            prior: current,
+            applied_at: now.clone(),
+        };
+        if let Ok(store) = dg_win::store::Store::open_default() {
+            let mut store = store;
+            let _ = store.record_lock(&record);
+            let detail = serde_json::json!({
+                "hardware_id": hw,
+                "device": ds.device.name,
+            });
+            let _ = store.record_event(
+                dg_core::EventKind::LockApplied,
+                &now,
+                &format!("Locked driver for {} ({})", ds.device.name, msg),
+                Some(&detail.to_string()),
+            );
+        }
+        Ok((hw, format!("Locked {} ({}). {}", ds.device.name, hw, msg)))
+    })
+}
+
+fn unlock_cmd(args: &[String]) -> ExitCode {
+    let Some(instance_id) = args.get(1) else {
+        eprintln!("usage: driverguard unlock <device-instance-id>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    with_elevated_lock(|| -> Result<(String, String), String> {
+        let devices = dg_win::inventory::snapshot().map_err(|e| e.to_string())?;
+        let snap = dg_core::Snapshot { devices };
+        let ds = find_device_by_instance(&snap, instance_id)
+            .ok_or_else(|| format!("no device with instance id '{instance_id}'"))?;
+        let hw = pick_hardware_id(ds).ok_or_else(|| "device has no hardware IDs".to_string())?;
+        let store = dg_win::store::Store::open_default().map_err(|e| e.to_string())?;
+        let record = store
+            .get_lock(&hw)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("{} is not locked by DriverGuard", ds.device.name))?;
+        let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
+        let originally_enabled = record.prior.deny_enabled;
+        let plan = dg_core::plan_unlock(&current, &hw, originally_enabled, &ds.device.name);
+        if plan.is_empty() {
+            return Ok((hw, format!("{} is already unlocked.", ds.device.name)));
+        }
+        let msg = dg_win::elevate::run_apply_lock(&plan).map_err(|e| e.to_string())?;
+        if let Ok(mut store) = dg_win::store::Store::open_default() {
+            let _ = store.remove_lock(&hw);
+            let now = dg_win::now_iso8601_utc();
+            let detail = serde_json::json!({
+                "hardware_id": hw,
+                "device": ds.device.name,
+            });
+            let _ = store.record_event(
+                dg_core::EventKind::LockRemoved,
+                &now,
+                &format!("Unlocked driver for {} ({})", ds.device.name, msg),
+                Some(&detail.to_string()),
+            );
+        }
+        Ok((hw, format!("Unlocked {} ({}). {}", ds.device.name, hw, msg)))
+    })
+}
+
+fn unlock_all_cmd() -> ExitCode {
+    with_elevated_lock(|| -> Result<(String, String), String> {
+        let store = dg_win::store::Store::open_default().map_err(|e| e.to_string())?;
+        let records = store.list_locks().map_err(|e| e.to_string())?;
+        if records.is_empty() {
+            return Ok((String::new(), "No DriverGuard locks to remove.".to_owned()));
+        }
+        let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
+        let plan = dg_core::plan_unlock_all(&current, &records, true);
+        if plan.is_empty() {
+            return Ok((String::new(), "No changes needed.".to_owned()));
+        }
+        let msg = dg_win::elevate::run_apply_lock(&plan).map_err(|e| e.to_string())?;
+        if let Ok(mut store) = dg_win::store::Store::open_default() {
+            for r in &records {
+                let _ = store.remove_lock(&r.hardware_id);
+            }
+            let now = dg_win::now_iso8601_utc();
+            let detail = serde_json::json!({
+                "unlocked_count": records.len(),
+            });
+            let _ = store.record_event(
+                dg_core::EventKind::UnlockAll,
+                &now,
+                &format!("Unlocked {} drivers ({})", records.len(), msg),
+                Some(&detail.to_string()),
+            );
+        }
+        Ok((String::new(), format!("Unlocked {} drivers. {}", records.len(), msg)))
+    })
+}
+
+fn exclude_wu_cmd(args: &[String]) -> ExitCode {
+    let Some(flag) = args.get(1) else {
+        eprintln!("usage: driverguard exclude-wu-drivers <on|off>\n\n{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    let on = match flag.as_str() {
+        "on" | "true" | "1" => true,
+        "off" | "false" | "0" => false,
+        other => {
+            eprintln!("expected 'on' or 'off' (got '{other}')\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    with_elevated_lock(|| -> Result<(String, String), String> {
+        let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
+        let Some(plan) = dg_core::plan_set_wu_exclude(&current, on) else {
+            return Ok((String::new(), format!("Exclude WU drivers is already {}.", if on { "on" } else { "off" })));
+        };
+        let msg = dg_win::elevate::run_apply_lock(&plan).map_err(|e| e.to_string())?;
+        if let Ok(mut store) = dg_win::store::Store::open_default() {
+            let now = dg_win::now_iso8601_utc();
+            let detail = serde_json::json!({ "enabled": on });
+            let _ = store.record_event(
+                dg_core::EventKind::PolicyChanged,
+                &now,
+                &format!(
+                    "Exclude drivers from Windows Quality Updates → {} ({})",
+                    if on { "on" } else { "off" },
+                    msg
+                ),
+                Some(&detail.to_string()),
+            );
+        }
+        Ok((String::new(), format!("Exclude WU drivers set to {}. {}", if on { "on" } else { "off" }, msg)))
+    })
+}
+
+fn status_cmd() -> ExitCode {
+    match status_report() {
+        Ok(text) => { println!("{text}"); ExitCode::SUCCESS }
+        Err(e) => { eprintln!("status failed: {e}"); ExitCode::FAILURE }
+    }
+}
+
+fn status_report() -> Result<String, dg_win::WinError> {
+    let policy = dg_win::policy::read_state().unwrap_or_default();
+    let store = dg_win::store::Store::open_default()?;
+    let locks = store.list_locks()?;
+    let mut out = String::from("DriverGuard status\n");
+    out.push_str(&format!(
+        "  per-device deny list: {}\n",
+        if policy.deny_enabled { "enabled" } else { "disabled" }
+    ));
+    out.push_str(&format!("  denied hardware IDs: {}\n", policy.denied_hardware_ids.len()));
+    for id in &policy.denied_hardware_ids {
+        out.push_str(&format!("    - {id}\n"));
+    }
+    out.push_str(&format!(
+        "  exclude drivers from Windows Quality Updates: {}\n",
+        if policy.wu_exclude_drivers { "on" } else { "off" }
+    ));
+    out.push_str(&format!("  locks recorded: {}\n", locks.len()));
+    for r in &locks {
+        out.push_str(&format!(
+            "    - {} ({}) locked at {}\n",
+            r.device_name, r.hardware_id, r.applied_at
+        ));
+    }
+    Ok(out.trim_end().to_owned())
+}
+
+fn with_elevated_lock<F>(f: F) -> ExitCode
+where
+    F: FnOnce() -> Result<(String, String), String>,
+{
+    // Pre-flight best-effort restore point check / creation is done
+    // inside the elevated helper (apply_plan honors
+    // plan.create_restore_point). Here we just surface the result.
+    match f() {
+        Ok((_hw, msg)) => {
+            println!("{msg}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
