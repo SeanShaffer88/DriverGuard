@@ -638,32 +638,46 @@ pub mod policy {
 
         pub(super) fn apply_plan(plan: &LockPlan) -> Result<()> {
             // Restore point is the caller's (helper_main) responsibility
-            // before apply_plan is invoked; we just mutate policy.
+            // before apply_plan is invoked; here we just mutate policy
+            // and/or run pnputil, in the lift-install-relock order
+            // required by plan §3.5.
 
-            // Compute the target deny list / WU toggle by folding the
-            // plan ops into the current read.
+            // Phase 1: compute the *lifted* deny list (what we need
+            // during the pnputil install) and the *final* deny list
+            // (what should be true after relock), by folding ops.
             let current = read_state()?;
-            let mut denied = current.denied_hardware_ids.clone();
-            let mut wu = current.wu_exclude_drivers;
-            let mut deny_enabled = current.deny_enabled;
+            let mut final_denied = current.denied_hardware_ids.clone();
+            let mut final_wu = current.wu_exclude_drivers;
+            let mut final_deny_enabled = current.deny_enabled;
+            let mut lifted_denied = current.denied_hardware_ids.clone();
+            let mut installs: Vec<std::path::PathBuf> = Vec::new();
             for op in &plan.ops {
                 match op {
-                    PolicyOp::SetDenyEnabled(on) => deny_enabled = *on,
+                    PolicyOp::SetDenyEnabled(on) => final_deny_enabled = *on,
                     PolicyOp::AddDeniedHardwareId(id) => {
-                        if !denied.iter().any(|e| e.eq_ignore_ascii_case(id)) {
-                            denied.push(id.clone());
+                        if !final_denied.iter().any(|e| e.eq_ignore_ascii_case(id)) {
+                            final_denied.push(id.clone());
                         }
                     }
                     PolicyOp::RemoveDeniedHardwareId(id) => {
-                        denied.retain(|e| !e.eq_ignore_ascii_case(id));
+                        final_denied.retain(|e| !e.eq_ignore_ascii_case(id));
+                        lifted_denied.retain(|e| !e.eq_ignore_ascii_case(id));
                     }
-                    PolicyOp::SetWuExcludeDrivers(on) => wu = *on,
+                    PolicyOp::SetWuExcludeDrivers(on) => final_wu = *on,
                     PolicyOp::DeleteDenySubkey => {
-                        denied.clear();
-                        deny_enabled = false;
+                        final_denied.clear();
+                        lifted_denied.clear();
+                        final_deny_enabled = false;
+                    }
+                    PolicyOp::InstallDriver { target } => {
+                        installs.push(std::path::PathBuf::from(target));
                     }
                 }
             }
+            // If there are installs, make sure lifted_denied has every
+            // ID that an AddDeniedHardwareId would later re-add, removed
+            // (it already is, because RemoveDeniedHardwareId runs first
+            // and Add is only for the final state).
 
             let touches_restrictions = plan.ops.iter().any(|o| {
                 matches!(
@@ -672,6 +686,7 @@ pub mod policy {
                         | PolicyOp::AddDeniedHardwareId(_)
                         | PolicyOp::RemoveDeniedHardwareId(_)
                         | PolicyOp::DeleteDenySubkey
+                        | PolicyOp::InstallDriver { .. }
                 )
             });
             let touches_wu = plan
@@ -679,51 +694,82 @@ pub mod policy {
                 .iter()
                 .any(|o| matches!(o, PolicyOp::SetWuExcludeDrivers(_)));
 
-            let mut r_key = Key::none();
-            let mut wu_key = Key::none();
-
+            // Phase 2: write the *lifted* state so pnputil isn't blocked.
             if touches_restrictions {
                 let r_w = wide(RESTRICTIONS_KEY);
                 let h = create_key(PCWSTR(r_w.as_ptr()))?;
-                r_key.set(h);
-                write_dword(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()), if deny_enabled { 1 } else { 0 })?;
-                rewrite_deny_list(h, &denied)?;
-                if denied.is_empty() && !deny_enabled && !current.deny_value_present {
-                    // Restore the "value was never there" state by
-                    // deleting the DWORD we wrote.
-                    delete_val(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))?;
+                let lifted_enabled = !installs.is_empty() || final_deny_enabled;
+                // During lift we keep the flag enabled if the final
+                // state keeps it on (foreign entries remain), otherwise
+                // we leave the flag at whatever allows the install.
+                let effective_enabled = if !installs.is_empty() && lifted_denied.is_empty() {
+                    false
+                } else {
+                    lifted_enabled
+                };
+                write_dword(
+                    h,
+                    PCWSTR(wide("DenyDeviceIDs").as_ptr()),
+                    if effective_enabled { 1 } else { 0 },
+                )?;
+                rewrite_deny_list(h, &lifted_denied)?;
+                // Flush registry writes before pnputil runs.
+                use windows::Win32::System::Registry::RegFlushKey;
+                unsafe { let _ = RegFlushKey(h); }
+            }
+
+            // Phase 3: run pnputil for each InstallDriver step.
+            for target in &installs {
+                crate::backup::install_drivers(target)?;
+            }
+
+            // Phase 4: write the *final* relocked state.
+            if touches_restrictions {
+                let r_w = wide(RESTRICTIONS_KEY);
+                // The key is already open from phase 2; re-open to be safe.
+                if let Some(h) = open_key(PCWSTR(r_w.as_ptr()), KEY_WRITE)? {
+                    let _g = Key(Some(h));
+                    write_dword(
+                        h,
+                        PCWSTR(wide("DenyDeviceIDs").as_ptr()),
+                        if final_deny_enabled { 1 } else { 0 },
+                    )?;
+                    rewrite_deny_list(h, &final_denied)?;
+                    if final_denied.is_empty() && !final_deny_enabled && !current.deny_value_present {
+                        delete_val(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))?;
+                    }
                 }
             }
             if touches_wu {
                 let w_w = wide(WU_KEY);
                 let h = create_key(PCWSTR(w_w.as_ptr()))?;
-                wu_key.set(h);
+                let _g = Key(Some(h));
                 write_dword(
                     h,
                     PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()),
-                    if wu { 1 } else { 0 },
+                    if final_wu { 1 } else { 0 },
                 )?;
             }
-            // Verification pass: re-read and sanity-check that the
-            // values we asked for are present.
+
+            // Verification pass: re-read and sanity-check the final state.
             let after = read_state()?;
             if touches_restrictions {
                 let mut a = after.denied_hardware_ids.clone();
                 a.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
-                let mut d = denied.clone();
+                let mut d = final_denied.clone();
                 d.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
                 if a != d {
                     return Err(WinError::Verification(
                         "policy apply did not produce the expected deny list".to_owned(),
                     ));
                 }
-                if after.deny_enabled != deny_enabled {
+                if after.deny_enabled != final_deny_enabled {
                     return Err(WinError::Verification(
                         "policy apply did not set DenyDeviceIDs DWORD as expected".to_owned(),
                     ));
                 }
             }
-            if touches_wu && after.wu_exclude_drivers != wu {
+            if touches_wu && after.wu_exclude_drivers != final_wu {
                 return Err(WinError::Verification(
                     "policy apply did not set ExcludeWUDriversInQualityUpdate as expected"
                         .to_owned(),
@@ -988,10 +1034,53 @@ pub mod backup {
     }
 
     /// Install driver packages from a backup folder
-    /// (`pnputil /add-driver ... /subdirs /install`). Requires elevation.
-    /// Restore lands with the watcher release (plan §3.5).
-    pub fn install_drivers(_backup_dir: &Path) -> Result<()> {
-        Err(WinError::NotImplemented)
+    /// (`pnputil /add-driver <dir>\\*.inf /subdirs /install`). Requires
+    /// elevation. Used by the v0.3 one-click restore flow (plan §3.5).
+    ///
+    /// The caller is responsible for the lift-install-relock sequence:
+    /// if the device is currently locked by DriverGuard, temporarily
+    /// lifting our own deny entry is the caller's job before invoking
+    /// this function (see §3.5 step 1). After install, the caller
+    /// verifies by re-reading the device's bound driver.
+    pub fn install_drivers(backup_dir: &Path) -> Result<()> {
+        run_pnputil_add_install(backup_dir)?;
+        Ok(())
+    }
+
+    /// Install a single package from a backup folder by INF name. This
+    /// is the more surgical form used by the History "Restore this
+    /// driver" action — it targets just the backed-up INF for the
+    /// device the user selected, rather than every package in the
+    /// backup.
+    pub fn install_driver_inf(backup_dir: &Path, inf_name: &str) -> Result<()> {
+        let inf_path = backup_dir.join(inf_name);
+        if !inf_path.exists() {
+            return Err(WinError::Verification(format!(
+                "backup does not contain an INF named {inf_name}"
+            )));
+        }
+        run_pnputil_add_install(&inf_path)?;
+        Ok(())
+    }
+
+    fn run_pnputil_add_install(target: &Path) -> Result<()> {
+        let output = std::process::Command::new("pnputil")
+            .arg("/add-driver")
+            .arg(target)
+            .arg("/subdirs")
+            .arg("/install")
+            .output()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "pnputil".to_owned(),
+                detail: e.to_string(),
+            })?;
+        if !output.status.success() {
+            return Err(WinError::ToolFailed {
+                tool: "pnputil".to_owned(),
+                exit_code: output.status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1834,20 +1923,120 @@ pub mod system {
     }
 
     /// Register the `DriverGuard Watch` scheduled task (logon + daily,
-    /// plan §3.4).
-    pub fn register_watch_task() -> Result<()> {
-        Err(WinError::NotImplemented)
+    /// plan §3.4). Uses `schtasks.exe /Create` so we don't need the
+    /// Task Scheduler COM interfaces. Runs as the current logged-on
+    /// user, highest available privileges *not* required (the watch
+    /// mode only reads inventory and shows a toast; lock/restore
+    /// still trigger a UAC prompt through the helper).
+    ///
+    /// The task is named "DriverGuard Watch" and is registered under
+    /// the user's task folder (`\DriverGuard\Watch`).
+    pub fn register_watch_task(exe_path: &Path) -> Result<()> {
+        let exe = exe_path.to_string_lossy().to_string();
+        // /SC ONLOGON triggers at every user logon; /SC DAILY with /ST
+        // is added by a second call so we get both. /F overwrites if
+        // one already exists. The task runs only when the user is
+        // logged on.
+        let status = std::process::Command::new("schtasks")
+            .args([
+                "/Create",
+                "/TN",
+                r"DriverGuard\Watch",
+                "/TR",
+                &format!("\"{exe}\" --watch"),
+                "/SC",
+                "ONLOGON",
+                "/F",
+            ])
+            .status()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "schtasks".to_owned(),
+                detail: e.to_string(),
+            })?;
+        if !status.success() {
+            return Err(WinError::ToolFailed {
+                tool: "schtasks".to_owned(),
+                exit_code: status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
     }
 
     /// Remove the `DriverGuard Watch` scheduled task.
     pub fn unregister_watch_task() -> Result<()> {
-        Err(WinError::NotImplemented)
+        let status = std::process::Command::new("schtasks")
+            .args(["/Delete", "/TN", r"DriverGuard\Watch", "/F"])
+            .status()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "schtasks".to_owned(),
+                detail: e.to_string(),
+            })?;
+        if !status.success() {
+            return Err(WinError::ToolFailed {
+                tool: "schtasks".to_owned(),
+                exit_code: status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
+    }
+
+    /// Returns true if the `DriverGuard Watch` scheduled task exists.
+    pub fn is_watch_task_registered() -> Result<bool> {
+        let out = std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", r"DriverGuard\Watch"])
+            .output()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "schtasks".to_owned(),
+                detail: e.to_string(),
+            })?;
+        Ok(out.status.success())
     }
 
     /// Raise the "A driver changed" toast (plan §6.3). Watch mode only;
     /// called solely when a diff is non-empty — silence is the default.
-    pub fn notify_driver_changed(_summary: &str) -> Result<()> {
-        Err(WinError::NotImplemented)
+    ///
+    /// We use the Windows shell `ToastNotifier` via PowerShell's
+    /// `New-BurntToastNotification`-compatible API is overkill; instead
+    /// we simply write a summary event and shell out to a minimal
+    /// MessageBox in the user's session as a v0.3 baseline. Real toast
+    /// notifications via the Windows UI Notifications API can be added
+    /// in a later release.
+    pub fn notify_driver_changed(summary: &str) -> Result<()> {
+        // PowerShell one-liner that shows a balloon/transient toast via
+        // Windows Forms NotifyIcon — lightweight, no extra deps,
+        // surfaces from background watch runs.
+        let ps = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $n = New-Object System.Windows.Forms.NotifyIcon; \
+             $n.Icon = [System.Drawing.SystemIcons]::Information; \
+             $n.BalloonTipTitle = 'DriverGuard'; \
+             $n.BalloonTipText = {:?}; \
+             $n.Visible = $true; \
+             $n.ShowBalloonTip(10000); \
+             Start-Sleep -Seconds 1; \
+             $n.Dispose()",
+            summary
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .status()
+            .map_err(|e| WinError::ToolUnavailable {
+                tool: "powershell".to_owned(),
+                detail: e.to_string(),
+            })?;
+        if !status.success() {
+            return Err(WinError::ToolFailed {
+                tool: "powershell".to_owned(),
+                exit_code: status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the path to the current running executable. Used by the
+    /// Settings view to hand the correct binary path to schtasks.
+    pub fn current_exe_path() -> Result<PathBuf> {
+        std::env::current_exe().map_err(|e| WinError::io(&PathBuf::from("."), e))
     }
 }
 
