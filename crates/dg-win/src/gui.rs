@@ -41,6 +41,8 @@ pub enum GuiEvent<M> {
     ViewSelected(usize),
     /// The action button was clicked.
     BackupClicked,
+    /// The secondary (right-of-action) button was clicked.
+    SecondaryClicked,
     /// The user activated (double-clicked / Enter) a list row. Index is
     /// the 0-based row index in the current view.
     RowActivated(usize),
@@ -57,6 +59,7 @@ struct Handles {
     nav: isize,
     list: isize,
     button: isize,
+    secondary: isize,
     status: isize,
 }
 
@@ -88,11 +91,20 @@ impl<M> Gui<M> {
     /// Enable or disable the action button (e.g. while a backup runs).
     pub fn set_backup_enabled(&self, enabled: bool) {
         unsafe_set_enabled(self.handles.button, enabled);
+        unsafe_set_enabled(self.handles.secondary, enabled);
     }
 
     /// Change the action-button label (per-view primary action, §6.2).
     pub fn set_backup_label(&self, text: &str) {
         unsafe_set_text(self.handles.button, text);
+    }
+
+    /// Change the secondary (right-of-primary) button label and toggle
+    /// its visibility. Pass an empty string to hide it. Secondary
+    /// button clicks arrive as [`GuiEvent::SecondaryClicked`].
+    pub fn set_secondary(&self, text: &str) {
+        unsafe_set_text(self.handles.secondary, text);
+        unsafe_set_visible(self.handles.secondary, !text.is_empty());
     }
 
     /// Replace the list-view columns and clear its contents.
@@ -239,6 +251,19 @@ fn unsafe_set_enabled(addr: isize, enabled: bool) {
 
 #[cfg(not(target_os = "windows"))]
 fn unsafe_set_enabled(_addr: isize, _enabled: bool) {}
+
+#[cfg(target_os = "windows")]
+fn unsafe_set_visible(addr: isize, visible: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW, HWND};
+    use std::ffi::c_void;
+    // Invariant: addr is our button control.
+    unsafe {
+        let _ = ShowWindow(HWND(addr as *mut c_void), if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unsafe_set_visible(_addr: isize, _visible: bool) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_rows(list_addr: isize, columns: usize, rows: &[Vec<String>]) {
@@ -442,6 +467,7 @@ where
 
     const WM_WORKER: u32 = 0x8001;
     const ID_BACKUP: usize = 1001;
+    const ID_SECONDARY: usize = 1004;
     const ID_NAV: usize = 1002;
     const ID_LIST: usize = 1003;
     const NAV_WIDTH: i32 = 160;
@@ -449,6 +475,7 @@ where
     const BUTTON_H: i32 = 32;
     const STATUS_H: i32 = 20;
     const BUTTON_W: i32 = 200;
+    const BUTTON_GAP: i32 = 8;
 
     type Handler<M> = Box<dyn FnMut(GuiEvent<M>, &Gui<M>) + 'static>;
 
@@ -506,11 +533,22 @@ where
                 (height - 2 * GUTTER).max(0),
                 true,
             );
+            let primary_w = BUTTON_W.min(content_w);
             let _ = MoveWindow(
                 hwnd(h.button),
                 content_x,
                 GUTTER,
-                BUTTON_W.min(content_w),
+                primary_w,
+                BUTTON_H,
+                true,
+            );
+            let sec_x = content_x + primary_w + BUTTON_GAP;
+            let sec_w = (content_w - primary_w - BUTTON_GAP).max(0).min(BUTTON_W);
+            let _ = MoveWindow(
+                hwnd(h.secondary),
+                sec_x,
+                GUTTER,
+                sec_w,
                 BUTTON_H,
                 true,
             );
@@ -575,6 +613,8 @@ where
                 let notify = (wparam.0 >> 16) & 0xFFFF;
                 if id == ID_BACKUP && notify == 0 {
                     fire(state, GuiEvent::BackupClicked);
+                } else if id == ID_SECONDARY && notify == 0 {
+                    fire(state, GuiEvent::SecondaryClicked);
                 } else if id == ID_NAV && notify as u32 == LBN_SELCHANGE as u32 {
                     let lres = unsafe {
                         SendMessageW(
@@ -713,6 +753,27 @@ where
             .unwrap_or_default();
             state.handles.button = button.0 as isize;
 
+            // Secondary button: hidden by default, shown per-view via
+            // Gui::set_secondary (e.g. Settings uses it for a second
+            // action like toggling the watch task).
+            let empty_label = wide("");
+            let secondary = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                PCWSTR(empty_label.as_ptr()),
+                WS_CHILD | WINDOW_STYLE(BS_PUSHBUTTON as u32), // starts hidden
+                NAV_WIDTH + GUTTER + BUTTON_W + BUTTON_GAP,
+                GUTTER,
+                BUTTON_W,
+                BUTTON_H,
+                Some(parent),
+                Some(HMENU(ID_SECONDARY as *mut c_void)),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            state.handles.secondary = secondary.0 as isize;
+
             let list = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 WC_LISTVIEWW,
@@ -775,7 +836,7 @@ where
             .unwrap_or_default();
             state.handles.status = status.0 as isize;
 
-            for child in [nav, button, list, status] {
+            for child in [nav, button, secondary, list, status] {
                 SendMessageW(
                     child,
                     WM_SETFONT,

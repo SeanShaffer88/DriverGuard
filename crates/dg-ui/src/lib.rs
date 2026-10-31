@@ -88,6 +88,8 @@ enum Msg {
     /// true for locked, false for unlocked. String is a human-readable
     /// status message for the status line.
     LockFinished { locked: bool, message: String },
+    /// The watch-task toggle completed; bool is true for registered.
+    WatchToggled { registered: bool, message: String },
 }
 
 /// A completed backup, as reported to the status line.
@@ -96,11 +98,21 @@ struct BackupDone {
     packages: usize,
 }
 
+/// Which Settings secondary action is currently visible, so a click on
+/// the secondary button can be dispatched. The button is hidden in
+/// views that don't need a second action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryAction {
+    None,
+    ToggleWatch,
+}
+
 /// Window state (UI thread only).
 #[derive(Default)]
 struct App {
     view: View,
     backup_running: bool,
+    secondary: SecondaryAction,
     /// Last loaded inventory, used to refresh the Devices view header
     /// and to build Settings/About summaries.
     last_devices: Option<Vec<DeviceSnapshot>>,
@@ -129,6 +141,8 @@ impl App {
         gui.set_columns(&columns_for(view));
         gui.set_backup_label(action_label(view));
         gui.set_backup_enabled(!self.backup_running || view != View::Devices);
+        self.secondary = SecondaryAction::None;
+        gui.set_secondary("");
         match view {
             View::Devices => {
                 if self.last_device_count.is_none() {
@@ -161,7 +175,7 @@ impl App {
         }
     }
 
-    fn render_settings(&self, gui: &Gui<Msg>) {
+    fn render_settings(&mut self, gui: &Gui<Msg>) {
         let mut rows: Vec<Vec<String>> = Vec::new();
         rows.push(vec![
             "Version".to_owned(),
@@ -208,6 +222,12 @@ impl App {
             "DriverGuard makes no network calls.".to_owned(),
         ]);
         gui.set_rows(&rows);
+        self.secondary = SecondaryAction::ToggleWatch;
+        gui.set_secondary(if watch_on {
+            "Unregister watch task"
+        } else {
+            "Register watch task"
+        });
         gui.set_status(&format!("Settings. {}", self.device_summary()));
     }
 
@@ -224,6 +244,13 @@ impl App {
                     self.switch_view(new_view, gui);
                 }
             }
+            GuiEvent::SecondaryClicked => match (self.view, self.secondary) {
+                (View::Settings, SecondaryAction::ToggleWatch) => {
+                    gui.set_status("Updating watch task…");
+                    spawn_watch_toggle(gui.handle());
+                }
+                _ => {}
+            },
             GuiEvent::BackupClicked => match self.view {
                 View::Devices => {
                     if self.backup_running {
@@ -367,6 +394,13 @@ impl App {
                     self.render_settings(gui);
                 }
                 let _ = locked; // reserved for future icon state
+            }
+            GuiEvent::Worker(Msg::WatchToggled { registered, message }) => {
+                gui.set_status(&message);
+                let _ = registered;
+                if self.view == View::Settings {
+                    self.render_settings(gui);
+                }
             }
             GuiEvent::RowActivated(idx) => self.on_row_activated(idx, gui),
             GuiEvent::Closed => {}
@@ -546,6 +580,40 @@ fn run_lock_toggle(hardware_id: &str, device_name: &str, unlock: bool) -> (bool,
             Err(e) => (false, format!("Lock failed: {e}")),
         }
     }
+}
+
+/// Toggle the scheduled watch task on a worker thread and report the
+/// result to the UI. Uses the current state to decide register vs.
+/// unregister.
+fn spawn_watch_toggle(handle: GuiHandle<Msg>) {
+    std::thread::spawn(move || {
+        let currently = dg_win::system::is_watch_task_registered().unwrap_or(false);
+        let msg = if currently {
+            match dg_win::system::unregister_watch_task() {
+                Ok(()) => Msg::WatchToggled {
+                    registered: false,
+                    message: "DriverGuard Watch task removed.".to_owned(),
+                },
+                Err(e) => Msg::WatchToggled {
+                    registered: currently,
+                    message: format!("Could not unregister watch task: {e}"),
+                },
+            }
+        } else {
+            match dg_win::system::current_exe_path().and_then(|p| dg_win::system::register_watch_task(&p))
+            {
+                Ok(()) => Msg::WatchToggled {
+                    registered: true,
+                    message: "DriverGuard Watch task registered (runs at logon).".to_owned(),
+                },
+                Err(e) => Msg::WatchToggled {
+                    registered: currently,
+                    message: format!("Could not register watch task: {e}"),
+                },
+            }
+        };
+        handle.post(msg);
+    });
 }
 
 /// Load the inventory on a worker thread, record it in history (like
