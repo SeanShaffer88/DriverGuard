@@ -166,23 +166,42 @@ impl App {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "(unavailable)".to_owned()),
         ]);
+        let policy = dg_win::policy::read_state().unwrap_or_default();
         rows.push(vec![
-            "Lock drivers (v0.2)".to_owned(),
-            "Planned — see docs/ROADMAP.md".to_owned(),
+            "Per-device deny list".to_owned(),
+            format!(
+                "{} ({} entries)",
+                if policy.deny_enabled { "enabled" } else { "disabled" },
+                policy.denied_hardware_ids.len()
+            ),
         ]);
         rows.push(vec![
-            "Watcher (v0.3)".to_owned(),
-            "Planned — see docs/ROADMAP.md".to_owned(),
+            "Exclude drivers from Windows Quality Updates".to_owned(),
+            if policy.wu_exclude_drivers { "on" } else { "off" }.to_owned(),
+        ]);
+        let locks = dg_win::store::Store::open_default()
+            .and_then(|s| s.list_locks())
+            .unwrap_or_default();
+        rows.push(vec![
+            "Active locks".to_owned(),
+            format!("{}", locks.len()),
+        ]);
+        let watch_on = dg_win::system::is_watch_task_registered().unwrap_or(false);
+        rows.push(vec![
+            "Watcher scheduled task".to_owned(),
+            if watch_on {
+                "registered (runs at logon)"
+            } else {
+                "not registered"
+            }
+            .to_owned(),
         ]);
         rows.push(vec![
             "Network / telemetry".to_owned(),
             "DriverGuard makes no network calls.".to_owned(),
         ]);
         gui.set_rows(&rows);
-        gui.set_status(&format!(
-            "Settings. {}",
-            self.device_summary()
-        ));
+        gui.set_status(&format!("Settings. {}", self.device_summary()));
     }
 
     fn on_event(&mut self, event: GuiEvent<Msg>, gui: &Gui<Msg>) {
