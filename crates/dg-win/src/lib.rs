@@ -408,7 +408,6 @@ pub mod policy {
         impl Key {
             fn none() -> Self { Key(None) }
             fn set(&mut self, h: HKEY) { self.0 = Some(h); }
-            fn get(&self) -> Option<HKEY> { self.0 }
         }
         impl Drop for Key { fn drop(&mut self) { if let Some(h) = self.0 { close(h); } } }
 
@@ -444,28 +443,6 @@ pub mod policy {
             };
             if WIN32_ERROR(st) != WIN32_ERROR(0) {
                 return Err(api_err(st, "RegCreateKeyExW failed"));
-            }
-            Ok(h)
-        }
-
-        fn create_subkey(parent: HKEY, sub_pcw: PCWSTR) -> Result<HKEY> {
-            let mut h = HKEY::default();
-            let mut disp = 0u32;
-            let st = unsafe {
-                RegCreateKeyExW(
-                    parent,
-                    sub_pcw,
-                    0,
-                    PCWSTR::null(),
-                    0,
-                    KEY_WRITE,
-                    std::ptr::null(),
-                    &mut h,
-                    Some(&mut disp),
-                )
-            };
-            if WIN32_ERROR(st) != WIN32_ERROR(0) {
-                return Err(api_err(st, "RegCreateKeyExW (subkey) failed"));
             }
             Ok(h)
         }
