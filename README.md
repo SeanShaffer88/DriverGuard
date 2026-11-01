@@ -8,16 +8,17 @@ user-chosen driver (GPU drivers are the classic case) with an older
 Microsoft-supplied one — and the built-in recovery paths don't always help.
 DriverGuard exists to make that situation boring.
 
-> **Status: v0.3 in progress.** Inventory, backup, history (with the
-> events audit log), policy-based driver locking, system-restore-point
-> integration, the hardened elevated JSON helper, a CLI for
-> lock/unlock/unlock-all/WU toggle/status, and a headless `--watch`
-> mode with scheduled-task registration and driver-change notifications
-> are all implemented and CI-tested on Windows. Remaining v0.3 work:
-> GUI wiring for double-click lock/unlock confirmation, restore from
-> History, WU/lock/watch toggles in Settings, and real toast
-> notifications (currently a PowerShell balloon-tip baseline). Treat
-> this as a pre-release — try it, and please report what you find.
+> **Status: v0.3 code-complete; on-machine verification in progress.**
+> Inventory, backup, history, per-device locking with registry policy and
+> system restore points, a hardened UAC helper JSON channel, the Watchdog
+> scheduled task (ONLOGON + daily 9 AM) with driver-change notifications,
+> one-click restore from backups, a double-click-to-lock/unlock confirmation
+> flow in the Devices window, and a live Settings view showing policy state
+> and watch-task registration are all implemented and merged to main.
+> Treat as pre-release: the code has not yet been built and verified on
+> real Windows 10/11 Home and Pro machines (CI runs on `windows-latest`
+> but the sandbox cannot run `cargo` to pre-vet compile errors), so the
+> first few builds on CI will iterate on fixes before v0.3 is tagged.
 
 ## What it will do
 
