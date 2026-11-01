@@ -1960,6 +1960,26 @@ pub mod system {
                 exit_code: status.code().unwrap_or(-1),
             });
         }
+        // Add a daily 9 AM trigger on top of the logon trigger so users
+        // who leave their machine logged in for long stretches still
+        // get a periodic check (plan §3.4). schtasks accepts one /SC per
+        // /Create, so we issue a second create to add the daily trigger;
+        // /F ensures we don't fail on "task already exists".
+        let exe2 = exe.clone();
+        let _ = std::process::Command::new("schtasks")
+            .args([
+                "/Create",
+                "/TN",
+                r"DriverGuard\Watch",
+                "/TR",
+                &format!("\"{exe2}\" --watch"),
+                "/SC",
+                "DAILY",
+                "/ST",
+                "09:00",
+                "/F",
+            ])
+            .status();
         Ok(())
     }
 
