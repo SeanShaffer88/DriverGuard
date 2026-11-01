@@ -306,8 +306,8 @@ pub fn plan_unlock_all(current: &PolicyState, our_records: &[LockRecord], reset_
         .filter(|id| !our_ids.iter().any(|ours| ours.eq_ignore_ascii_case(id)))
         .count();
     if remaining_foreign == 0 && !original_deny_enabled && current.deny_enabled {
-        ops.push(PolicyOp::DeleteDenySubkey);
         ops.push(PolicyOp::SetDenyEnabled(false));
+        ops.push(PolicyOp::DeleteDenySubkey);
     }
     if reset_wu_toggle {
         // Find the oldest prior wu_exclude value across records —
@@ -374,8 +374,13 @@ pub fn plan_unlock(
         .filter(|id| !id.eq_ignore_ascii_case(hardware_id))
         .count();
     if remaining == 0 && !originally_enabled && current.deny_enabled {
-        ops.push(PolicyOp::DeleteDenySubkey);
+        // Disable the DWORD first, then delete the DenyDeviceIDs subkey.
+        // The DWORD lives on the parent key; the numbered values live in
+        // the subkey. apply_plan processes ops in order, so writing the
+        // DWORD to 0 before deleting the subkey keeps the parent key's
+        // state consistent even if the subkey delete runs second.
         ops.push(PolicyOp::SetDenyEnabled(false));
+        ops.push(PolicyOp::DeleteDenySubkey);
     }
     LockPlan {
         create_restore_point: true,
@@ -788,8 +793,8 @@ mod tests {
             plan.ops,
             vec![
                 PolicyOp::RemoveDeniedHardwareId("PCI\\VEN_1002&DEV_73FF".to_owned()),
-                PolicyOp::DeleteDenySubkey,
                 PolicyOp::SetDenyEnabled(false),
+                PolicyOp::DeleteDenySubkey,
             ]
         );
     }
