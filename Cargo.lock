@@ -33,6 +33,7 @@ version = "0.1.0"
 dependencies = [
  "dg-core",
  "dg-win",
+ "serde_json",
 ]
 
 [[package]]
@@ -41,6 +42,7 @@ version = "0.1.0"
 dependencies = [
  "dg-core",
  "rusqlite",
+ "serde",
  "serde_json",
  "thiserror",
  "windows",

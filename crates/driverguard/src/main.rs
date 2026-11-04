@@ -88,11 +88,14 @@ fn inventory() -> ExitCode {
                     record_event_best_effort(
                         dg_core::EventKind::Inventory,
                         &format!("Recorded {device_count} devices (snapshot #{snap_id})"),
-                        Some(serde_json::json!({
-                            "device_count": device_count,
-                            "snapshot_id": snap_id,
-                            "origin": "cli",
-                        }).to_string()),
+                        Some(
+                            serde_json::json!({
+                                "device_count": device_count,
+                                "snapshot_id": snap_id,
+                                "origin": "cli",
+                            })
+                            .to_string(),
+                        ),
                     );
                     ExitCode::SUCCESS
                 }
@@ -114,16 +117,18 @@ fn inventory() -> ExitCode {
 /// user actually asked for. Returns the snapshot id when recorded, or 0.
 fn record_snapshot_best_effort(snapshot: &dg_core::Snapshot, origin: &str) -> i64 {
     match dg_win::store::Store::open_default() {
-        Ok(mut store) => match store.record_snapshot(&dg_win::now_iso8601_utc(), origin, snapshot) {
-            Ok(id) => {
-                eprintln!("(recorded as snapshot #{id} in history)");
-                id
+        Ok(mut store) => {
+            match store.record_snapshot(&dg_win::now_iso8601_utc(), origin, snapshot) {
+                Ok(id) => {
+                    eprintln!("(recorded as snapshot #{id} in history)");
+                    id
+                }
+                Err(e) => {
+                    eprintln!("warning: could not record snapshot in history: {e}");
+                    0
+                }
             }
-            Err(e) => {
-                eprintln!("warning: could not record snapshot in history: {e}");
-                0
-            }
-        },
+        }
         Err(e) => {
             eprintln!("warning: history unavailable: {e}");
             0
@@ -158,11 +163,8 @@ fn record_backup_best_effort(folder: &std::path::Path, manifest: &dg_core::Backu
 }
 
 fn record_event_best_effort(kind: dg_core::EventKind, summary: &str, detail: Option<String>) {
-    match dg_win::store::Store::open_default() {
-        Ok(mut store) => {
-            let _ = store.record_event(kind, &dg_win::now_iso8601_utc(), summary, detail.as_deref());
-        }
-        Err(_) => {}
+    if let Ok(mut store) = dg_win::store::Store::open_default() {
+        let _ = store.record_event(kind, &dg_win::now_iso8601_utc(), summary, detail.as_deref());
     }
 }
 
@@ -264,12 +266,20 @@ fn history_report() -> Result<String, dg_win::WinError> {
     }
     out.push_str(&format!(
         "  per-device deny list: {} ({} entries)\n",
-        if policy.deny_enabled { "enabled" } else { "disabled" },
+        if policy.deny_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         policy.denied_hardware_ids.len()
     ));
     out.push_str(&format!(
         "  exclude drivers from Windows Quality Updates: {}\n",
-        if policy.wu_exclude_drivers { "on" } else { "off" }
+        if policy.wu_exclude_drivers {
+            "on"
+        } else {
+            "off"
+        }
     ));
     out.push_str(&format!("  backups: {}\n", backups.len()));
     for (folder, manifest) in &backups {
@@ -323,7 +333,8 @@ fn lock_cmd(args: &[String]) -> ExitCode {
         let snap = dg_core::Snapshot { devices };
         let ds = find_device_by_instance(&snap, instance_id)
             .ok_or_else(|| format!("no device with instance id '{instance_id}'"))?;
-        let hw = pick_hardware_id(ds).ok_or_else(|| "device has no hardware IDs to lock".to_string())?;
+        let hw =
+            pick_hardware_id(ds).ok_or_else(|| "device has no hardware IDs to lock".to_string())?;
         let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
         let plan = dg_core::plan_lock(&current, &hw, &ds.device.name);
         if plan.is_empty() {
@@ -351,7 +362,8 @@ fn lock_cmd(args: &[String]) -> ExitCode {
                 Some(&detail.to_string()),
             );
         }
-        Ok((hw, format!("Locked {} ({}). {}", ds.device.name, hw, msg)))
+        let message = format!("Locked {} ({}). {}", ds.device.name, hw, msg);
+        Ok((hw, message))
     })
 }
 
@@ -392,7 +404,8 @@ fn unlock_cmd(args: &[String]) -> ExitCode {
                 Some(&detail.to_string()),
             );
         }
-        Ok((hw, format!("Unlocked {} ({}). {}", ds.device.name, hw, msg)))
+        let message = format!("Unlocked {} ({}). {}", ds.device.name, hw, msg);
+        Ok((hw, message))
     })
 }
 
@@ -424,7 +437,10 @@ fn unlock_all_cmd() -> ExitCode {
                 Some(&detail.to_string()),
             );
         }
-        Ok((String::new(), format!("Unlocked {} drivers. {}", records.len(), msg)))
+        Ok((
+            String::new(),
+            format!("Unlocked {} drivers. {}", records.len(), msg),
+        ))
     })
 }
 
@@ -444,7 +460,13 @@ fn exclude_wu_cmd(args: &[String]) -> ExitCode {
     with_elevated_lock(|| -> Result<(String, String), String> {
         let current = dg_win::policy::read_state().map_err(|e| e.to_string())?;
         let Some(plan) = dg_core::plan_set_wu_exclude(&current, on) else {
-            return Ok((String::new(), format!("Exclude WU drivers is already {}.", if on { "on" } else { "off" })));
+            return Ok((
+                String::new(),
+                format!(
+                    "Exclude WU drivers is already {}.",
+                    if on { "on" } else { "off" }
+                ),
+            ));
         };
         let msg = dg_win::elevate::run_apply_lock(&plan).map_err(|e| e.to_string())?;
         if let Ok(mut store) = dg_win::store::Store::open_default() {
@@ -461,7 +483,14 @@ fn exclude_wu_cmd(args: &[String]) -> ExitCode {
                 Some(&detail.to_string()),
             );
         }
-        Ok((String::new(), format!("Exclude WU drivers set to {}. {}", if on { "on" } else { "off" }, msg)))
+        Ok((
+            String::new(),
+            format!(
+                "Exclude WU drivers set to {}. {}",
+                if on { "on" } else { "off" },
+                msg
+            ),
+        ))
     })
 }
 
@@ -510,9 +539,18 @@ fn watch_cmd() -> ExitCode {
     if diff.is_empty() {
         return ExitCode::SUCCESS;
     }
-    let n_added = diff.iter().filter(|c| c.before.is_none() && c.after.is_some()).count();
-    let n_removed = diff.iter().filter(|c| c.before.is_some() && c.after.is_none()).count();
-    let n_changed = diff.iter().filter(|c| c.before.is_some() && c.after.is_some()).count();
+    let n_added = diff
+        .iter()
+        .filter(|c| c.before.is_none() && c.after.is_some())
+        .count();
+    let n_removed = diff
+        .iter()
+        .filter(|c| c.before.is_some() && c.after.is_none())
+        .count();
+    let n_changed = diff
+        .iter()
+        .filter(|c| c.before.is_some() && c.after.is_some())
+        .count();
     let summary = format!(
         "DriverGuard found {n_changed} driver version changes, {n_added} new devices, {n_removed} removed."
     );
@@ -532,13 +570,13 @@ fn watch_cmd() -> ExitCode {
             })
         })
         .collect();
-    let snap_id = match store.record_snapshot(&dg_win::now_iso8601_utc(), "watch", &after) {
-        Ok(id) => Some(id),
-        Err(_) => None,
-    };
-    let detail_json =
-        serde_json::to_string(&serde_json::json!({ "snapshot_id": snap_id, "changes": detail_changes }))
-            .unwrap_or_default();
+    let snap_id = store
+        .record_snapshot(&dg_win::now_iso8601_utc(), "watch", &after)
+        .ok();
+    let detail_json = serde_json::to_string(
+        &serde_json::json!({ "snapshot_id": snap_id, "changes": detail_changes }),
+    )
+    .unwrap_or_default();
     let _ = store.record_event(
         dg_core::EventKind::DriverChanged,
         &dg_win::now_iso8601_utc(),
@@ -625,8 +663,14 @@ fn restore_cmd(args: &[String]) -> ExitCode {
 
 fn status_cmd() -> ExitCode {
     match status_report() {
-        Ok(text) => { println!("{text}"); ExitCode::SUCCESS }
-        Err(e) => { eprintln!("status failed: {e}"); ExitCode::FAILURE }
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("status failed: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -637,15 +681,26 @@ fn status_report() -> Result<String, dg_win::WinError> {
     let mut out = String::from("DriverGuard status\n");
     out.push_str(&format!(
         "  per-device deny list: {}\n",
-        if policy.deny_enabled { "enabled" } else { "disabled" }
+        if policy.deny_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     ));
-    out.push_str(&format!("  denied hardware IDs: {}\n", policy.denied_hardware_ids.len()));
+    out.push_str(&format!(
+        "  denied hardware IDs: {}\n",
+        policy.denied_hardware_ids.len()
+    ));
     for id in &policy.denied_hardware_ids {
         out.push_str(&format!("    - {id}\n"));
     }
     out.push_str(&format!(
         "  exclude drivers from Windows Quality Updates: {}\n",
-        if policy.wu_exclude_drivers { "on" } else { "off" }
+        if policy.wu_exclude_drivers {
+            "on"
+        } else {
+            "off"
+        }
     ));
     out.push_str(&format!("  locks recorded: {}\n", locks.len()));
     for r in &locks {

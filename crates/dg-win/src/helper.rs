@@ -56,12 +56,19 @@ pub enum HelperResponse {
 
 impl HelperResponse {
     pub fn ok(message: impl Into<String>) -> Self {
-        HelperResponse::Ok { message: message.into() }
+        HelperResponse::Ok {
+            message: message.into(),
+        }
     }
     pub fn err(message: impl Into<String>, code: Option<u32>) -> Self {
-        HelperResponse::Err { message: message.into(), code }
+        HelperResponse::Err {
+            message: message.into(),
+            code,
+        }
     }
-    pub fn is_ok(&self) -> bool { matches!(self, HelperResponse::Ok { .. }) }
+    pub fn is_ok(&self) -> bool {
+        matches!(self, HelperResponse::Ok { .. })
+    }
 }
 
 /// The directory used for request/response files. Lives under

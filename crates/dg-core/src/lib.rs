@@ -222,7 +222,9 @@ pub enum PolicyOp {
     DeleteDenySubkey,
     /// Run `pnputil /add-driver <target> /subdirs /install` (v0.3
     /// restore). The target is an absolute path to an INF or folder.
-    InstallDriver { target: String },
+    InstallDriver {
+        target: String,
+    },
 }
 
 /// A lock record stored in the database for one hardware ID that
@@ -284,11 +286,12 @@ pub fn plan_set_wu_exclude(current: &PolicyState, enabled: bool) -> Option<LockP
 /// ones who enabled it, and (optionally) reset the WU toggle back to
 /// its state before us. The caller passes in the records it holds so
 /// we can distinguish our entries from foreign ones.
-pub fn plan_unlock_all(current: &PolicyState, our_records: &[LockRecord], reset_wu_toggle: bool) -> LockPlan {
-    let our_ids: Vec<String> = our_records
-        .iter()
-        .map(|r| r.hardware_id.clone())
-        .collect();
+pub fn plan_unlock_all(
+    current: &PolicyState,
+    our_records: &[LockRecord],
+    reset_wu_toggle: bool,
+) -> LockPlan {
+    let our_ids: Vec<String> = our_records.iter().map(|r| r.hardware_id.clone()).collect();
     let mut ops: Vec<PolicyOp> = Vec::new();
     let original_deny_enabled = our_records
         .iter()
@@ -848,9 +851,7 @@ mod tests {
         // Because a foreign entry remains, deny list stays enabled and
         // the subkey is NOT deleted.
         assert!(!plan.ops.contains(&PolicyOp::DeleteDenySubkey));
-        assert!(!plan
-            .ops
-            .contains(&PolicyOp::SetDenyEnabled(false)));
+        assert!(!plan.ops.contains(&PolicyOp::SetDenyEnabled(false)));
     }
 
     #[test]

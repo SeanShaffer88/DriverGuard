@@ -56,6 +56,7 @@ pub type Result<T> = std::result::Result<T, WinError>;
 pub mod elevate;
 pub mod gui;
 pub mod helper;
+mod policy_transaction;
 
 /// Current UTC time as an RFC 3339 string, for manifest timestamps.
 pub fn now_iso8601_utc() -> String {
@@ -378,15 +379,18 @@ pub mod policy {
 
     #[cfg(target_os = "windows")]
     mod imp {
-        use super::super::{Result, WinError};
         use super::{LockPlan, PolicyOp, PolicyState};
+        use super::{Result, WinError};
         use std::ffi::c_void;
         use windows::core::PCWSTR;
-        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, WIN32_ERROR};
+        use windows::Win32::Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_PATH_NOT_FOUND, WIN32_ERROR,
+        };
         use windows::Win32::System::Registry::{
             RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW, RegEnumValueW,
             RegGetValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-            KEY_WRITE, REG_DWORD, REG_SZ, RRF_RT_DWORD, RRF_RT_REG_SZ,
+            KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_OPTION_NON_VOLATILE,
+            REG_SAM_FLAGS, REG_SZ, REG_VALUE_TYPE, RRF_RT_DWORD, RRF_RT_REG_SZ,
         };
 
         const RESTRICTIONS_KEY: &str =
@@ -400,26 +404,33 @@ pub mod policy {
 
         /// Closes a key; safe to call on a null/default HKEY.
         fn close(h: HKEY) {
-            unsafe { let _ = RegCloseKey(h); }
+            unsafe {
+                let _ = RegCloseKey(h);
+            }
         }
 
         /// RAII key closer.
         struct Key(Option<HKEY>);
-        impl Key {
-            fn none() -> Self { Key(None) }
-            fn set(&mut self, h: HKEY) { self.0 = Some(h); }
+        impl Drop for Key {
+            fn drop(&mut self) {
+                if let Some(h) = self.0 {
+                    close(h);
+                }
+            }
         }
-        impl Drop for Key { fn drop(&mut self) { if let Some(h) = self.0 { close(h); } } }
 
         fn api_err(code: u32, msg: &'static str) -> WinError {
-            WinError::Api { code, message: msg.to_owned() }
+            WinError::Api {
+                code,
+                message: msg.to_owned(),
+            }
         }
 
-        fn open_key(path_pcw: PCWSTR, access: u32) -> Result<Option<HKEY>> {
+        fn open_key(path_pcw: PCWSTR, access: REG_SAM_FLAGS) -> Result<Option<HKEY>> {
             let mut h = HKEY::default();
-            let st = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_pcw, 0, access, &mut h) };
-            match WIN32_ERROR(st) {
-                ERROR_FILE_NOT_FOUND => Ok(None),
+            let st = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path_pcw, None, access, &mut h) };
+            match st {
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
                 WIN32_ERROR(0) => Ok(Some(h)),
                 other => Err(api_err(other.0, "RegOpenKeyExW failed")),
             }
@@ -427,22 +438,22 @@ pub mod policy {
 
         fn create_key(path_pcw: PCWSTR) -> Result<HKEY> {
             let mut h = HKEY::default();
-            let mut disp = 0u32;
+            let mut disp = REG_CREATE_KEY_DISPOSITION::default();
             let st = unsafe {
                 RegCreateKeyExW(
                     HKEY_LOCAL_MACHINE,
                     path_pcw,
-                    0,
+                    None,
                     PCWSTR::null(),
-                    0,
-                    KEY_WRITE,
-                    std::ptr::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_READ | KEY_WRITE,
+                    None,
                     &mut h,
                     Some(&mut disp),
                 )
             };
-            if WIN32_ERROR(st) != WIN32_ERROR(0) {
-                return Err(api_err(st, "RegCreateKeyExW failed"));
+            if st != WIN32_ERROR(0) {
+                return Err(api_err(st.0, "RegCreateKeyExW failed"));
             }
             Ok(h)
         }
@@ -450,7 +461,7 @@ pub mod policy {
         fn read_dword(h: HKEY, name_pcw: PCWSTR) -> Result<Option<u32>> {
             let mut v: u32 = 0;
             let mut sz = std::mem::size_of::<u32>() as u32;
-            let mut ty = 0u32;
+            let mut ty = REG_VALUE_TYPE::default();
             let st = unsafe {
                 RegGetValueW(
                     h,
@@ -462,8 +473,8 @@ pub mod policy {
                     Some(&mut sz),
                 )
             };
-            match WIN32_ERROR(st) {
-                ERROR_FILE_NOT_FOUND => Ok(None),
+            match st {
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
                 WIN32_ERROR(0) => Ok(Some(v)),
                 other => Err(api_err(other.0, "RegGetValueW (DWORD) failed")),
             }
@@ -475,10 +486,16 @@ pub mod policy {
             let sub_w = wide(DENY_SUBKEY);
             let mut sub = HKEY::default();
             let st = unsafe {
-                RegOpenKeyExW(restrictions_h, PCWSTR(sub_w.as_ptr()), 0, KEY_READ, &mut sub)
+                RegOpenKeyExW(
+                    restrictions_h,
+                    PCWSTR(sub_w.as_ptr()),
+                    None,
+                    KEY_READ,
+                    &mut sub,
+                )
             };
-            match WIN32_ERROR(st) {
-                ERROR_FILE_NOT_FOUND => return Ok(Vec::new()),
+            match st {
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => return Ok(Vec::new()),
                 WIN32_ERROR(0) => {}
                 other => return Err(api_err(other.0, "RegOpenKeyExW (DenyDeviceIDs) failed")),
             }
@@ -489,34 +506,49 @@ pub mod policy {
                 let mut name_len = name_buf.len() as u32;
                 let st = unsafe {
                     RegEnumValueW(
-                        sub, idx,
-                        windows::core::PWSTR(name_buf.as_mut_ptr()),
+                        sub,
+                        idx,
+                        Some(windows::core::PWSTR(name_buf.as_mut_ptr())),
                         &mut name_len,
-                        std::ptr::null(), std::ptr::null_mut(),
-                        std::ptr::null_mut(), std::ptr::null_mut(),
+                        None,
+                        None,
+                        None,
+                        None,
                     )
                 };
-                if WIN32_ERROR(st) == ERROR_NO_MORE_ITEMS { break; }
-                if WIN32_ERROR(st) != WIN32_ERROR(0) {
-                    return Err(api_err(st, "RegEnumValueW failed"));
+                if st == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if st != WIN32_ERROR(0) {
+                    return Err(api_err(st.0, "RegEnumValueW failed"));
                 }
                 let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-                let Ok(num) = name.parse::<u32>() else { continue };
+                let Ok(num) = name.parse::<u32>() else {
+                    continue;
+                };
                 let mut data = [0u16; 1024];
                 let mut bytes = (data.len() * 2) as u32;
-                let mut ty = 0u32;
+                let mut ty = REG_VALUE_TYPE::default();
                 let name_pcw = PCWSTR(name_buf.as_ptr());
                 let st2 = unsafe {
                     RegGetValueW(
-                        sub, name_pcw, PCWSTR::null(),
-                        RRF_RT_REG_SZ, Some(&mut ty),
+                        sub,
+                        PCWSTR::null(),
+                        name_pcw,
+                        RRF_RT_REG_SZ,
+                        Some(&mut ty),
                         Some(data.as_mut_ptr() as *mut c_void),
                         Some(&mut bytes),
                     )
                 };
-                if WIN32_ERROR(st2) != WIN32_ERROR(0) { continue; }
+                if st2 != WIN32_ERROR(0) {
+                    return Err(api_err(st2.0, "RegGetValueW (deny entry) failed"));
+                }
                 let n_chars = (bytes / 2) as usize;
-                let end = data[..n_chars].iter().position(|&u| u == 0).unwrap_or(n_chars);
+                let end = data[..n_chars]
+                    .iter()
+                    .position(|&u| u == 0)
+                    .unwrap_or(n_chars);
                 pairs.push((num, String::from_utf16_lossy(&data[..end])));
             }
             pairs.sort_by_key(|(n, _)| *n);
@@ -525,70 +557,310 @@ pub mod policy {
 
         fn write_dword(h: HKEY, name_pcw: PCWSTR, v: u32) -> Result<()> {
             let bytes = v.to_le_bytes();
-            let st = unsafe { RegSetValueExW(h, name_pcw, 0, REG_DWORD, Some(&bytes)) };
-            if WIN32_ERROR(st) != WIN32_ERROR(0) {
-                return Err(api_err(st, "RegSetValueExW (DWORD) failed"));
+            let st = unsafe { RegSetValueExW(h, name_pcw, None, REG_DWORD, Some(&bytes)) };
+            if st != WIN32_ERROR(0) {
+                return Err(api_err(st.0, "RegSetValueExW (DWORD) failed"));
             }
             Ok(())
         }
 
         fn delete_val(h: HKEY, name_pcw: PCWSTR) -> Result<()> {
             let st = unsafe { RegDeleteValueW(h, name_pcw) };
-            if WIN32_ERROR(st) != WIN32_ERROR(0) && WIN32_ERROR(st) != ERROR_FILE_NOT_FOUND {
-                return Err(api_err(st, "RegDeleteValueW failed"));
+            if st != WIN32_ERROR(0) && st != ERROR_FILE_NOT_FOUND {
+                return Err(api_err(st.0, "RegDeleteValueW failed"));
             }
             Ok(())
         }
 
         fn write_sz(h: HKEY, name_pcw: PCWSTR, text: &str) -> Result<()> {
             let data: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-            let bytes = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2)
-            };
-            let st = unsafe { RegSetValueExW(h, name_pcw, 0, REG_SZ, Some(bytes)) };
-            if WIN32_ERROR(st) != WIN32_ERROR(0) {
-                return Err(api_err(st, "RegSetValueExW (SZ) failed"));
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+            let st = unsafe { RegSetValueExW(h, name_pcw, None, REG_SZ, Some(bytes)) };
+            if st != WIN32_ERROR(0) {
+                return Err(api_err(st.0, "RegSetValueExW (SZ) failed"));
             }
             Ok(())
         }
 
-        /// Rewrite the numbered DenyDeviceIDs subkey from `entries`. If
-        /// `entries` is empty the subkey is deleted entirely.
-        fn rewrite_deny_list(parent: HKEY, entries: &[String]) -> Result<()> {
-            let sub_w = wide(DENY_SUBKEY);
-            // Open-or-create the subkey.
-            let mut sub = HKEY::default();
-            let mut disp = 0u32;
-            let create_st = unsafe {
-                RegCreateKeyExW(
-                    parent, PCWSTR(sub_w.as_ptr()), 0, PCWSTR::null(), 0,
-                    KEY_WRITE, std::ptr::null(), &mut sub, Some(&mut disp),
-                )
-            };
-            if WIN32_ERROR(create_st) != WIN32_ERROR(0) {
-                return Err(api_err(create_st, "RegCreateKeyExW (DenyDeviceIDs subkey) failed"));
-            }
-            let _g = Key(Some(sub));
-            // Wipe existing numbered values.
-            for n in 0u32..4096 {
-                let nw = wide(&n.to_string());
-                let st = unsafe { RegDeleteValueW(sub, PCWSTR(nw.as_ptr())) };
-                if WIN32_ERROR(st) == ERROR_FILE_NOT_FOUND { break; }
-            }
-            if entries.is_empty() {
-                // Close the subkey first, then delete it.
-                drop(_g);
-                let st = unsafe { RegDeleteKeyW(parent, PCWSTR(sub_w.as_ptr())) };
-                if WIN32_ERROR(st) != WIN32_ERROR(0) && WIN32_ERROR(st) != ERROR_FILE_NOT_FOUND {
-                    return Err(api_err(st, "RegDeleteKeyW (DenyDeviceIDs subkey) failed"));
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct RawValue {
+            name: Vec<u16>,
+            kind: u32,
+            data: Vec<u8>,
+        }
+
+        fn values(h: HKEY) -> Result<Vec<RawValue>> {
+            let mut result = Vec::new();
+            for index in 0..4096 {
+                let mut name = vec![0u16; 16384];
+                let mut name_len = name.len() as u32;
+                let mut kind = 0;
+                let mut bytes = 0;
+                // SAFETY: buffers and size pointers are valid; no data buffer is supplied for sizing.
+                let status = unsafe {
+                    RegEnumValueW(
+                        h,
+                        index,
+                        Some(windows::core::PWSTR(name.as_mut_ptr())),
+                        &mut name_len,
+                        None,
+                        Some(&mut kind),
+                        None,
+                        Some(&mut bytes),
+                    )
+                };
+                if status == ERROR_NO_MORE_ITEMS {
+                    return Ok(result);
                 }
-                return Ok(());
+                if status != WIN32_ERROR(0) {
+                    return Err(api_err(status.0, "policy value enumeration failed"));
+                }
+                if bytes > 16 * 1024 * 1024 {
+                    return Err(WinError::Verification(
+                        "policy value exceeds capture limit".into(),
+                    ));
+                }
+                let mut data = vec![0; bytes as usize];
+                name_len = name.len() as u32;
+                // SAFETY: allocated buffers match their supplied capacities; errors abort capture.
+                let status = unsafe {
+                    RegEnumValueW(
+                        h,
+                        index,
+                        Some(windows::core::PWSTR(name.as_mut_ptr())),
+                        &mut name_len,
+                        None,
+                        Some(&mut kind),
+                        Some(data.as_mut_ptr()),
+                        Some(&mut bytes),
+                    )
+                };
+                if status != WIN32_ERROR(0) {
+                    return Err(api_err(status.0, "policy value capture failed"));
+                }
+                name.truncate(name_len as usize);
+                name.push(0);
+                data.truncate(bytes as usize);
+                result.push(RawValue { name, kind, data });
             }
-            for (i, e) in entries.iter().enumerate() {
-                let nw = wide(&i.to_string());
-                write_sz(sub, PCWSTR(nw.as_ptr()), e)?;
+            Err(WinError::Verification(
+                "policy exceeds capture entry limit".into(),
+            ))
+        }
+
+        fn text(value: &RawValue) -> Option<String> {
+            if value.kind != REG_SZ.0 || value.data.len() % 2 != 0 {
+                return None;
+            }
+            let units: Vec<_> = value
+                .data
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .take_while(|u| *u != 0)
+                .collect();
+            String::from_utf16(&units).ok()
+        }
+
+        fn numbered(value: &RawValue) -> bool {
+            String::from_utf16_lossy(&value.name[..value.name.len() - 1])
+                .parse::<u32>()
+                .is_ok()
+        }
+
+        fn rewrite_deny_list(entries: &[String]) -> Result<()> {
+            let path = wide(&format!("{RESTRICTIONS_KEY}\\{DENY_SUBKEY}"));
+            let h = create_key(PCWSTR(path.as_ptr()))?;
+            let guard = Key(Some(h));
+            let old = values(h)?;
+            let mut remaining = entries.to_vec();
+            let mut occupied = Vec::new();
+            for value in &old {
+                if let Some(id) = text(value).filter(|_| numbered(value)) {
+                    if let Some(index) = remaining
+                        .iter()
+                        .position(|id2| id.eq_ignore_ascii_case(id2))
+                    {
+                        remaining.remove(index);
+                        occupied.push(value.name.clone());
+                    } else {
+                        delete_val(h, PCWSTR(value.name.as_ptr()))?;
+                    }
+                } else {
+                    occupied.push(value.name.clone());
+                }
+            }
+            let mut number = 0u32;
+            for id in remaining {
+                while occupied.contains(&wide(&number.to_string())) {
+                    number += 1;
+                }
+                let name = wide(&number.to_string());
+                write_sz(h, PCWSTR(name.as_ptr()), &id)?;
+                occupied.push(name);
+            }
+            if occupied.is_empty() {
+                drop(guard);
+                // SAFETY: only this now-empty subkey is removed; subkeys cause a reported failure.
+                let status = unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, PCWSTR(path.as_ptr())) };
+                if status != WIN32_ERROR(0) {
+                    return Err(api_err(status.0, "empty deny key deletion failed"));
+                }
             }
             Ok(())
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct SavedKey {
+            path: String,
+            values: Option<Vec<RawValue>>,
+            capture_values: bool,
+        }
+
+        trait Registry {
+            fn read(&self, path: &str, capture_values: bool) -> Result<Option<Vec<RawValue>>>;
+            fn create(&self, path: &str) -> Result<()>;
+            fn delete_key(&self, path: &str) -> Result<()>;
+            fn delete_value(&self, path: &str, name: &[u16]) -> Result<()>;
+            fn set_value(&self, path: &str, value: &RawValue) -> Result<()>;
+        }
+
+        struct NativeRegistry;
+        impl Registry for NativeRegistry {
+            fn read(&self, path: &str, capture_values: bool) -> Result<Option<Vec<RawValue>>> {
+                let Some(h) = open_key(PCWSTR(wide(path).as_ptr()), KEY_READ)? else {
+                    return Ok(None);
+                };
+                let _guard = Key(Some(h));
+                let mut vals = if capture_values {
+                    values(h)?
+                } else {
+                    Vec::new()
+                };
+                vals.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(Some(vals))
+            }
+            fn create(&self, path: &str) -> Result<()> {
+                let _guard = Key(Some(create_key(PCWSTR(wide(path).as_ptr()))?));
+                Ok(())
+            }
+            fn delete_key(&self, path: &str) -> Result<()> {
+                // SAFETY: deletion is nonrecursive; foreign child keys cause failure rather than deletion.
+                let status =
+                    unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, PCWSTR(wide(path).as_ptr())) };
+                if status != WIN32_ERROR(0)
+                    && status != ERROR_FILE_NOT_FOUND
+                    && status != ERROR_PATH_NOT_FOUND
+                {
+                    return Err(api_err(status.0, "policy key restoration failed"));
+                }
+                Ok(())
+            }
+            fn delete_value(&self, path: &str, name: &[u16]) -> Result<()> {
+                let h = create_key(PCWSTR(wide(path).as_ptr()))?;
+                let _guard = Key(Some(h));
+                delete_val(h, PCWSTR(name.as_ptr()))
+            }
+            fn set_value(&self, path: &str, value: &RawValue) -> Result<()> {
+                let h = create_key(PCWSTR(wide(path).as_ptr()))?;
+                let _guard = Key(Some(h));
+                // SAFETY: captured name, type and data remain alive through the call; h is guarded.
+                let status = unsafe {
+                    RegSetValueExW(
+                        h,
+                        PCWSTR(value.name.as_ptr()),
+                        None,
+                        REG_VALUE_TYPE(value.kind),
+                        Some(&value.data),
+                    )
+                };
+                if status != WIN32_ERROR(0) {
+                    return Err(api_err(status.0, "policy restoration write failed"));
+                }
+                Ok(())
+            }
+        }
+
+        fn capture(touches_restrictions: bool, touches_wu: bool) -> Result<Vec<SavedKey>> {
+            capture_with(&NativeRegistry, touches_restrictions, touches_wu)
+        }
+
+        fn capture_with(
+            registry: &impl Registry,
+            touches_restrictions: bool,
+            touches_wu: bool,
+        ) -> Result<Vec<SavedKey>> {
+            let mut paths = Vec::new();
+            if touches_restrictions {
+                paths.push(RESTRICTIONS_KEY.to_owned());
+                paths.push(format!("{RESTRICTIONS_KEY}\\{DENY_SUBKEY}"));
+            }
+            if touches_wu {
+                paths.push(WU_KEY.to_owned());
+            }
+            let targets = paths.clone();
+            for target in &targets {
+                let mut parent = target.as_str();
+                while let Some((prefix, _)) = parent.rsplit_once('\\') {
+                    if !paths.iter().any(|p| p == prefix) {
+                        paths.push(prefix.to_owned());
+                    }
+                    parent = prefix;
+                }
+            }
+            paths.sort_by_key(|p| p.len());
+            paths
+                .into_iter()
+                .map(|path| {
+                    let capture_values = targets.contains(&path);
+                    let saved = registry.read(&path, capture_values)?;
+                    Ok(SavedKey {
+                        path,
+                        values: saved,
+                        capture_values,
+                    })
+                })
+                .collect()
+        }
+
+        fn restore(saved: &[SavedKey]) -> Result<()> {
+            restore_with(&NativeRegistry, saved)
+        }
+
+        fn restore_with(registry: &impl Registry, saved: &[SavedKey]) -> Result<()> {
+            let mut errors = Vec::new();
+            for key in saved.iter().rev() {
+                let result: Result<()> = (|| {
+                    if let Some(prior) = &key.values {
+                        if !key.capture_values {
+                            return Ok(());
+                        }
+                        registry.create(&key.path)?;
+                        let current = registry.read(&key.path, true)?.unwrap_or_default();
+                        for value in &current {
+                            if !prior.iter().any(|v| v.name == value.name) {
+                                registry.delete_value(&key.path, &value.name)?;
+                            }
+                        }
+                        for value in prior {
+                            if !current.contains(value) {
+                                registry.set_value(&key.path, value)?;
+                            }
+                        }
+                    } else {
+                        registry.delete_key(&key.path)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    errors.push(error.to_string());
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(WinError::Verification(errors.join("; ")))
+            }
         }
 
         pub(super) fn read_state() -> Result<PolicyState> {
@@ -605,7 +877,9 @@ pub mod policy {
             }
             if let Some(h) = open_key(PCWSTR(wu_w.as_ptr()), KEY_READ)? {
                 let _g = Key(Some(h));
-                if let Some(v) = read_dword(h, PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()))? {
+                if let Some(v) =
+                    read_dword(h, PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()))?
+                {
                     state.wu_exclude_drivers = v != 0;
                     state.wu_exclude_present = true;
                 }
@@ -671,89 +945,271 @@ pub mod policy {
                 .iter()
                 .any(|o| matches!(o, PolicyOp::SetWuExcludeDrivers(_)));
 
-            // Phase 2: write the *lifted* state so pnputil isn't blocked.
-            if touches_restrictions {
-                let r_w = wide(RESTRICTIONS_KEY);
-                let h = create_key(PCWSTR(r_w.as_ptr()))?;
-                let _h_guard = Key(Some(h));
-                let lifted_enabled = !installs.is_empty() || final_deny_enabled;
-                // During lift we keep the flag enabled if the final
-                // state keeps it on (foreign entries remain), otherwise
-                // we leave the flag at whatever allows the install.
-                let effective_enabled = if !installs.is_empty() && lifted_denied.is_empty() {
-                    false
-                } else {
-                    lifted_enabled
-                };
-                write_dword(
-                    h,
-                    PCWSTR(wide("DenyDeviceIDs").as_ptr()),
-                    if effective_enabled { 1 } else { 0 },
-                )?;
-                rewrite_deny_list(h, &lifted_denied)?;
-                // Flush registry writes before pnputil runs.
-                use windows::Win32::System::Registry::RegFlushKey;
-                unsafe { let _ = RegFlushKey(h); }
-            }
-
-            // Phase 3: run pnputil for each InstallDriver step.
-            for target in &installs {
-                crate::backup::install_drivers(target)?;
-            }
-
-            // Phase 4: write the *final* relocked state.
-            if touches_restrictions {
-                let r_w = wide(RESTRICTIONS_KEY);
-                // The key is already open from phase 2; re-open to be safe.
-                if let Some(h) = open_key(PCWSTR(r_w.as_ptr()), KEY_WRITE)? {
-                    let _g = Key(Some(h));
-                    write_dword(
-                        h,
-                        PCWSTR(wide("DenyDeviceIDs").as_ptr()),
-                        if final_deny_enabled { 1 } else { 0 },
-                    )?;
-                    rewrite_deny_list(h, &final_denied)?;
-                    if final_denied.is_empty() && !final_deny_enabled && !current.deny_value_present {
-                        delete_val(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))?;
-                    }
-                }
-            }
-            if touches_wu {
-                let w_w = wide(WU_KEY);
-                let h = create_key(PCWSTR(w_w.as_ptr()))?;
-                let _g = Key(Some(h));
-                write_dword(
-                    h,
-                    PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()),
-                    if final_wu { 1 } else { 0 },
-                )?;
-            }
-
-            // Verification pass: re-read and sanity-check the final state.
-            let after = read_state()?;
-            if touches_restrictions {
-                let mut a = after.denied_hardware_ids.clone();
-                a.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
-                let mut d = final_denied.clone();
-                d.sort_by(|x, y| x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()));
-                if a != d {
-                    return Err(WinError::Verification(
-                        "policy apply did not produce the expected deny list".to_owned(),
-                    ));
-                }
-                if after.deny_enabled != final_deny_enabled {
-                    return Err(WinError::Verification(
-                        "policy apply did not set DenyDeviceIDs DWORD as expected".to_owned(),
-                    ));
-                }
-            }
-            if touches_wu && after.wu_exclude_drivers != final_wu {
-                return Err(WinError::Verification(
+            let saved = capture(touches_restrictions, touches_wu)?;
+            use crate::policy_transaction::{execute, Phase};
+            execute(
+                installs.len(),
+                |phase| {
+                    match phase {
+                        Phase::Lift => {
+                            // Phase 2: write the *lifted* state so pnputil isn't blocked.
+                            if touches_restrictions {
+                                let r_w = wide(RESTRICTIONS_KEY);
+                                let h = create_key(PCWSTR(r_w.as_ptr()))?;
+                                let _h_guard = Key(Some(h));
+                                let lifted_enabled = !installs.is_empty() || final_deny_enabled;
+                                // During lift we keep the flag enabled if the final
+                                // state keeps it on (foreign entries remain), otherwise
+                                // we leave the flag at whatever allows the install.
+                                let effective_enabled =
+                                    if !installs.is_empty() && lifted_denied.is_empty() {
+                                        false
+                                    } else {
+                                        lifted_enabled
+                                    };
+                                write_dword(
+                                    h,
+                                    PCWSTR(wide("DenyDeviceIDs").as_ptr()),
+                                    if effective_enabled { 1 } else { 0 },
+                                )?;
+                                rewrite_deny_list(&lifted_denied)?;
+                                // Flush registry writes before pnputil runs.
+                                use windows::Win32::System::Registry::RegFlushKey;
+                                // SAFETY: h is a live key held by the guard.
+                                let status = unsafe { RegFlushKey(h) };
+                                if status != WIN32_ERROR(0) {
+                                    return Err(api_err(status.0, "policy flush failed"));
+                                }
+                                let lifted = read_state()?;
+                                if lifted.denied_hardware_ids != lifted_denied
+                                    || lifted.deny_enabled != effective_enabled
+                                {
+                                    return Err(WinError::Verification(
+                                        "lifted policy reread mismatch".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        Phase::Install(index) => crate::backup::install_drivers(&installs[index])?,
+                        Phase::Finalize => {
+                            // Phase 4: write the *final* relocked state.
+                            if touches_restrictions {
+                                let r_w = wide(RESTRICTIONS_KEY);
+                                // The key is already open from phase 2; re-open to be safe.
+                                let h = open_key(PCWSTR(r_w.as_ptr()), KEY_READ | KEY_WRITE)?
+                                    .ok_or_else(|| {
+                                        WinError::Verification(
+                                            "policy key disappeared before relock".into(),
+                                        )
+                                    })?;
+                                {
+                                    let _g = Key(Some(h));
+                                    write_dword(
+                                        h,
+                                        PCWSTR(wide("DenyDeviceIDs").as_ptr()),
+                                        if final_deny_enabled { 1 } else { 0 },
+                                    )?;
+                                    rewrite_deny_list(&final_denied)?;
+                                    if final_denied.is_empty()
+                                        && !final_deny_enabled
+                                        && !current.deny_value_present
+                                    {
+                                        delete_val(h, PCWSTR(wide("DenyDeviceIDs").as_ptr()))?;
+                                    }
+                                }
+                            }
+                            if touches_wu {
+                                let w_w = wide(WU_KEY);
+                                let h = create_key(PCWSTR(w_w.as_ptr()))?;
+                                let _g = Key(Some(h));
+                                write_dword(
+                                    h,
+                                    PCWSTR(wide("ExcludeWUDriversInQualityUpdate").as_ptr()),
+                                    if final_wu { 1 } else { 0 },
+                                )?;
+                            }
+                        }
+                        Phase::Verify => {
+                            // Verification pass: re-read and sanity-check the final state.
+                            let after = read_state()?;
+                            if touches_restrictions {
+                                let mut a = after.denied_hardware_ids.clone();
+                                a.sort_by(|x, y| {
+                                    x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase())
+                                });
+                                let mut d = final_denied.clone();
+                                d.sort_by(|x, y| {
+                                    x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase())
+                                });
+                                if a != d {
+                                    return Err(WinError::Verification(
+                                        "policy apply did not produce the expected deny list"
+                                            .to_owned(),
+                                    ));
+                                }
+                                if after.deny_enabled != final_deny_enabled {
+                                    return Err(WinError::Verification(
+                                        "policy apply did not set DenyDeviceIDs DWORD as expected"
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
+                            if touches_wu && after.wu_exclude_drivers != final_wu {
+                                return Err(WinError::Verification(
                     "policy apply did not set ExcludeWUDriversInQualityUpdate as expected"
                         .to_owned(),
                 ));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+                || restore(&saved),
+                || {
+                    if capture(touches_restrictions, touches_wu)? == saved {
+                        Ok(())
+                    } else {
+                        Err(WinError::Verification(
+                            "policy pre-state reread mismatch".into(),
+                        ))
+                    }
+                },
+            )
+        }
+        #[cfg(test)]
+        mod snapshot_tests {
+            use super::*;
+            use std::cell::RefCell;
+            use std::collections::BTreeMap;
+
+            #[derive(Default)]
+            struct Mock {
+                keys: RefCell<BTreeMap<String, Vec<RawValue>>>,
+                fail: bool,
             }
-            Ok(())
+            impl Registry for Mock {
+                fn read(&self, path: &str, capture_values: bool) -> Result<Option<Vec<RawValue>>> {
+                    Ok(self.keys.borrow().get(path).map(|v| {
+                        let mut values = if capture_values {
+                            v.clone()
+                        } else {
+                            Vec::new()
+                        };
+                        values.sort_by(|a, b| a.name.cmp(&b.name));
+                        values
+                    }))
+                }
+                fn create(&self, path: &str) -> Result<()> {
+                    self.keys.borrow_mut().entry(path.into()).or_default();
+                    Ok(())
+                }
+                fn delete_key(&self, path: &str) -> Result<()> {
+                    if self.fail {
+                        return Err(WinError::Verification("injected delete failure".into()));
+                    }
+                    self.keys.borrow_mut().remove(path);
+                    Ok(())
+                }
+                fn delete_value(&self, path: &str, name: &[u16]) -> Result<()> {
+                    self.keys
+                        .borrow_mut()
+                        .get_mut(path)
+                        .unwrap()
+                        .retain(|v| v.name != name);
+                    Ok(())
+                }
+                fn set_value(&self, path: &str, value: &RawValue) -> Result<()> {
+                    if self.fail {
+                        return Err(WinError::Verification(
+                            "injected preservation failure".into(),
+                        ));
+                    }
+                    self.delete_value(path, &value.name)?;
+                    self.keys
+                        .borrow_mut()
+                        .get_mut(path)
+                        .unwrap()
+                        .push(value.clone());
+                    Ok(())
+                }
+            }
+
+            #[test]
+            fn exact_absent_keys_values_empty_keys_and_foreign_data_are_restored() {
+                for shape in 0..3 {
+                    let mock = Mock::default();
+                    if shape > 0 {
+                        mock.keys.borrow_mut().insert(
+                            RESTRICTIONS_KEY.into(),
+                            vec![RawValue {
+                                name: wide("foreign"),
+                                kind: 3,
+                                data: vec![0, 255, 17],
+                            }],
+                        );
+                        mock.keys
+                            .borrow_mut()
+                            .insert(format!("{RESTRICTIONS_KEY}\\{DENY_SUBKEY}"), Vec::new());
+                        mock.keys.borrow_mut().insert(WU_KEY.into(), Vec::new());
+                    }
+                    if shape == 2 {
+                        mock.keys.borrow_mut().insert(
+                            format!("{RESTRICTIONS_KEY}\\{DENY_SUBKEY}"),
+                            vec![
+                                RawValue {
+                                    name: wide("37"),
+                                    kind: REG_SZ.0,
+                                    data: wide("PCI\\foreign")
+                                        .into_iter()
+                                        .flat_map(u16::to_le_bytes)
+                                        .collect(),
+                                },
+                                RawValue {
+                                    name: wide("metadata"),
+                                    kind: 3,
+                                    data: vec![255, 0, 5],
+                                },
+                            ],
+                        );
+                    }
+                    let prior = capture_with(&mock, true, true).unwrap();
+                    for saved in &prior {
+                        mock.keys.borrow_mut().insert(
+                            saved.path.clone(),
+                            vec![RawValue {
+                                name: wide("created"),
+                                kind: REG_DWORD.0,
+                                data: vec![1, 0, 0, 0],
+                            }],
+                        );
+                    }
+                    restore_with(&mock, &prior).unwrap();
+                    assert_eq!(capture_with(&mock, true, true).unwrap(), prior);
+                }
+            }
+
+            #[test]
+            fn preservation_errors_are_reported_and_reread_detects_mismatch() {
+                let mut mock = Mock::default();
+                mock.keys.borrow_mut().insert(
+                    RESTRICTIONS_KEY.into(),
+                    vec![RawValue {
+                        name: wide("DenyDeviceIDs"),
+                        kind: REG_DWORD.0,
+                        data: vec![2, 0, 0, 0],
+                    }],
+                );
+                let prior = capture_with(&mock, true, true).unwrap();
+                mock.keys
+                    .borrow_mut()
+                    .insert(RESTRICTIONS_KEY.into(), Vec::new());
+                mock.fail = true;
+                assert!(restore_with(&mock, &prior)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("preservation failure"));
+                assert_ne!(capture_with(&mock, true, true).unwrap(), prior);
+            }
         }
     }
 }
@@ -1536,9 +1992,11 @@ PRAGMA user_version = 3;
             let mut out = Vec::new();
             for row in rows {
                 let (hw, name, prior_json, at) = row?;
-                let prior: PolicyState = serde_json::from_str(&prior_json).map_err(|e| {
-                    WinError::Api { code: 0, message: format!("corrupt lock prior_state_json: {e}") }
-                })?;
+                let prior: PolicyState =
+                    serde_json::from_str(&prior_json).map_err(|e| WinError::Api {
+                        code: 0,
+                        message: format!("corrupt lock prior_state_json: {e}"),
+                    })?;
                 out.push(LockRecord {
                     hardware_id: hw,
                     device_name: name,
@@ -1565,10 +2023,17 @@ PRAGMA user_version = 3;
             });
             match row {
                 Ok((hw, name, prior_json, at)) => {
-                    let prior: PolicyState = serde_json::from_str(&prior_json).map_err(|e| {
-                        WinError::Api { code: 0, message: format!("corrupt lock prior_state_json: {e}") }
-                    })?;
-                    Ok(Some(LockRecord { hardware_id: hw, device_name: name, prior, applied_at: at }))
+                    let prior: PolicyState =
+                        serde_json::from_str(&prior_json).map_err(|e| WinError::Api {
+                            code: 0,
+                            message: format!("corrupt lock prior_state_json: {e}"),
+                        })?;
+                    Ok(Some(LockRecord {
+                        hardware_id: hw,
+                        device_name: name,
+                        prior,
+                        applied_at: at,
+                    }))
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(e) => Err(e.into()),
@@ -1813,6 +2278,7 @@ PRAGMA user_version = 3;
 /// System integration: restore points, the watcher task, and toasts.
 pub mod system {
     use super::{Result, WinError};
+    use std::path::{Path, PathBuf};
 
     /// Create a system restore point before a policy-changing operation
     /// (plan §1.1, principle 4). Requires elevation (elevated helper).
@@ -1838,7 +2304,6 @@ pub mod system {
     #[cfg(target_os = "windows")]
     mod imp {
         use super::super::{Result, WinError};
-        use std::ffi::c_long;
 
         // SRSetRestorePoint lives in srclient.dll and is exposed with
         // the stdcall convention. These constants match the values in
@@ -1851,25 +2316,46 @@ pub mod system {
         // operation, and it produces a normal restore point in System
         // Restore UI.
 
-        #[repr(C)]
+        #[repr(C, packed)]
         struct RestorePointInfoW {
             dw_event_type: u32,
             dw_restore_pt_type: u32,
+            ll_sequence_number: i64,
             sz_description: [u16; 256],
         }
 
-        #[link(name = "srclient")]
+        #[repr(C, packed)]
+        struct StateMgrStatus {
+            n_status: u32,
+            ll_sequence_number: i64,
+        }
+
+        // The SDK library supplies a static wrapper, not an import symbol.
+        #[link(name = "srclient", kind = "static", modifiers = "-bundle")]
         extern "system" {
             fn SRSetRestorePointW(
-                p_smgr_status: *mut RestorePointInfoW,
-                p_status: *mut c_long,
+                p_restore_pt_spec: *mut RestorePointInfoW,
+                p_smgr_status: *mut StateMgrStatus,
             ) -> i32; // BOOL as i32
+        }
+
+        #[test]
+        fn restore_point_layout_matches_sdk() {
+            use std::mem::{align_of, offset_of, size_of};
+            assert_eq!(size_of::<RestorePointInfoW>(), 528);
+            assert_eq!(align_of::<RestorePointInfoW>(), 1);
+            assert_eq!(offset_of!(RestorePointInfoW, ll_sequence_number), 8);
+            assert_eq!(offset_of!(RestorePointInfoW, sz_description), 16);
+            assert_eq!(size_of::<StateMgrStatus>(), 12);
+            assert_eq!(align_of::<StateMgrStatus>(), 1);
+            assert_eq!(offset_of!(StateMgrStatus, ll_sequence_number), 4);
         }
 
         pub(super) fn create_restore_point(description: &str) -> Result<()> {
             let mut info = RestorePointInfoW {
                 dw_event_type: BEGIN_SYSTEM_CHANGE,
                 dw_restore_pt_type: APPLICATION_INSTALL,
+                ll_sequence_number: 0,
                 sz_description: [0u16; 256],
             };
             let mut written = 0usize;
@@ -1878,19 +2364,23 @@ pub mod system {
                 written = i + 1;
             }
             info.sz_description[written] = 0;
-            let mut seq: c_long = 0;
-            // SAFETY: info and seq are live, stack-allocated out args;
+            let mut status = StateMgrStatus {
+                n_status: 0,
+                ll_sequence_number: 0,
+            };
+            // SAFETY: info and status are live, SDK-layout stack arguments;
             // SRSetRestorePointW does not retain them past the call.
-            let ok = unsafe { SRSetRestorePointW(&mut info, &mut seq) };
+            let ok = unsafe { SRSetRestorePointW(&mut info, &mut status) };
             if ok == 0 {
+                let code = status.n_status;
                 // Returns FALSE (0) on error; the STAT_* codes in
-                // seq distinguish "service disabled" from "cancelled".
+                // status distinguish "service disabled" from "cancelled".
                 // We surface the numeric code; the UI uses it to give
                 // the user a clear message.
                 Err(WinError::Api {
-                    code: seq as u32,
+                    code,
                     message: format!(
-                        "could not create a system restore point (status {seq:#x}). \
+                        "could not create a system restore point (status {code:#x}). \
                          System Restore may be disabled."
                     ),
                 })

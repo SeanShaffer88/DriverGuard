@@ -13,11 +13,12 @@
 use crate::Result;
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 // Columns are tracked through shared interior mutability so the count
 // stays consistent across Gui<M> instances that are created per event.
-type ColumnCount = Arc<Cell<usize>>;
+type ColumnCount = Rc<Cell<usize>>;
 
 /// Static description of the window to create.
 #[derive(Debug, Clone)]
@@ -68,7 +69,7 @@ struct Handles {
 pub struct Gui<M> {
     queue: Arc<Mutex<VecDeque<M>>>,
     /// Number of columns currently installed in the list view; shared
-    /// with `State` via `Arc` so the count persists across per-event
+    /// with `State` via `Rc` so the count persists across per-event
     /// `Gui` instances.
     columns: ColumnCount,
     handles: Handles,
@@ -224,9 +225,10 @@ pub fn show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIcon)
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_text(addr: isize, text: &str) {
-    use windows::core::PCWSTR;
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowTextW, HWND};
     use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
     let t: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     // Invariant: addr is a live control created by this module; the
     // wide string outlives the synchronous SetWindowTextW call.
@@ -240,9 +242,9 @@ fn unsafe_set_text(_addr: isize, _text: &str) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_enabled(addr: isize, enabled: bool) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-    use windows::Win32::UI::WindowsAndMessaging::HWND;
     use std::ffi::c_void;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
     // Invariant: addr is the button handle created by this module.
     unsafe {
         let _ = EnableWindow(HWND(addr as *mut c_void), enabled);
@@ -254,11 +256,15 @@ fn unsafe_set_enabled(_addr: isize, _enabled: bool) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_visible(addr: isize, visible: bool) {
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW, HWND};
     use std::ffi::c_void;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE, SW_SHOW};
     // Invariant: addr is our button control.
     unsafe {
-        let _ = ShowWindow(HWND(addr as *mut c_void), if visible { SW_SHOW } else { SW_HIDE });
+        let _ = ShowWindow(
+            HWND(addr as *mut c_void),
+            if visible { SW_SHOW } else { SW_HIDE },
+        );
     }
 }
 
@@ -267,10 +273,13 @@ fn unsafe_set_visible(_addr: isize, _visible: bool) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_set_rows(list_addr: isize, columns: usize, rows: &[Vec<String>]) {
-    use windows::core::PWSTR;
-    use windows::Win32::UI::Controls::{LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTITEMW, LVM_SETITEMTEXTW};
-    use windows::Win32::UI::WindowsAndMessaging::{HWND, LPARAM, SendMessageW, WPARAM};
     use std::ffi::c_void;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{
+        LVIF_TEXT, LVITEMW, LVM_DELETEALLITEMS, LVM_INSERTITEMW, LVM_SETITEMTEXTW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
     let list = HWND(list_addr as *mut c_void);
     // Invariant: list is our list-view; LVITEMW pointers are valid for
     // each synchronous SendMessageW call, which is all the control needs.
@@ -311,22 +320,29 @@ fn unsafe_set_rows(_list: isize, _columns: usize, _rows: &[Vec<String>]) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_rebuild_columns(list_addr: isize, columns: &[(String, i32)]) {
-    use windows::core::PWSTR;
-    use windows::Win32::UI::Controls::{
-        LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
-        LVM_GETCOLUMNCOUNT, LVM_INSERTCOLUMNW,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{HWND, LPARAM, SendMessageW, WPARAM};
     use std::ffi::c_void;
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::Controls::{
+        HDM_GETITEMCOUNT, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVM_DELETEALLITEMS,
+        LVM_DELETECOLUMN, LVM_GETHEADER, LVM_INSERTCOLUMNW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
     let list = HWND(list_addr as *mut c_void);
     // Invariant: list is our list-view. Clearing items and rebuilding
     // columns is a supported sequence for LVS_REPORT controls.
     unsafe {
         SendMessageW(list, LVM_DELETEALLITEMS, Some(WPARAM(0)), Some(LPARAM(0)));
-        let existing = SendMessageW(list, LVM_GETCOLUMNCOUNT, Some(WPARAM(0)), Some(LPARAM(0)));
+        let header = SendMessageW(list, LVM_GETHEADER, None, None);
+        let existing = SendMessageW(HWND(header.0 as *mut c_void), HDM_GETITEMCOUNT, None, None);
         let existing = existing.0 as i32;
         for idx in (0..existing).rev() {
-            SendMessageW(list, LVM_DELETECOLUMN, Some(WPARAM(idx as usize)), Some(LPARAM(0)));
+            SendMessageW(
+                list,
+                LVM_DELETECOLUMN,
+                Some(WPARAM(idx as usize)),
+                Some(LPARAM(0)),
+            );
         }
         for (i, (title, width)) in columns.iter().enumerate() {
             let mut t: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -352,14 +368,20 @@ fn unsafe_rebuild_columns(_list: isize, _columns: &[(String, i32)]) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_post_worker(hwnd_addr: isize) {
-    use windows::Win32::Foundation::LPARAM;
-    use windows::Win32::UI::WindowsAndMessaging::{HWND, PostMessageW, WPARAM};
     use std::ffi::c_void;
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::Foundation::{HWND, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
     const WM_WORKER: u32 = 0x8001;
     // Invariant: PostMessageW is thread-safe; if the window is gone the
     // call simply fails.
     unsafe {
-        let _ = PostMessageW(Some(HWND(hwnd_addr as *mut c_void)), WM_WORKER, WPARAM(0), LPARAM(0));
+        let _ = PostMessageW(
+            Some(HWND(hwnd_addr as *mut c_void)),
+            WM_WORKER,
+            WPARAM(0),
+            LPARAM(0),
+        );
     }
 }
 
@@ -368,11 +390,15 @@ fn unsafe_post_worker(_hwnd: isize) {}
 
 #[cfg(target_os = "windows")]
 fn unsafe_open_folder(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    use std::os::windows::ffi::OsStrExt;
-    let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let verb: Vec<u16> = "explore".encode_utf16().chain(std::iter::once(0)).collect();
     // Best-effort affordance. ShellExecuteW returns a Result with a
     // fake HINSTANCE on success; we don't inspect it and we map any
@@ -418,9 +444,8 @@ fn unsafe_show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIc
     // SAFETY: MessageBoxW with a null HWND owner shows a task-modal
     // dialog on the current desktop; our wide strings are valid for
     // the duration of the synchronous call. No input state is mutated.
-    let res: MESSAGEBOX_RESULT = unsafe {
-        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), flags)
-    };
+    let res: MESSAGEBOX_RESULT =
+        unsafe { MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), flags) };
     match res.0 as i32 {
         1 => MsgResult::Ok,
         2 => MsgResult::Cancel,
@@ -431,7 +456,12 @@ fn unsafe_show_message(title: &str, text: &str, buttons: MsgButtons, icon: MsgIc
 }
 
 #[cfg(not(target_os = "windows"))]
-fn unsafe_show_message(_title: &str, _text: &str, _buttons: MsgButtons, _icon: MsgIcon) -> MsgResult {
+fn unsafe_show_message(
+    _title: &str,
+    _text: &str,
+    _buttons: MsgButtons,
+    _icon: MsgIcon,
+) -> MsgResult {
     MsgResult::Cancel
 }
 
@@ -453,16 +483,16 @@ where
     use windows::Win32::UI::Controls::{
         InitCommonControlsEx, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX, LVCF_SUBITEM, LVCF_TEXT,
         LVCF_WIDTH, LVCOLUMNW, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-        LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, WC_LISTVIEWW,
+        LVS_EX_FULLROWSELECT, LVS_EX_GRIDLINES, NM_DBLCLK, WC_LISTVIEWW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
         LoadCursorW, MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW,
         ShowWindow, TranslateMessage, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
         CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDC_ARROW, LBN_SELCHANGE, LBS_NOTIFY, LB_ADDSTRING,
-        LB_GETCURSEL, LB_SETCURSEL, MSG, NM_DBLCLK, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
-        WM_COMMAND, WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SIZE, WNDCLASSW,
-        WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VSCROLL, WS_VISIBLE,
+        LB_GETCURSEL, LB_SETCURSEL, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+        WM_CREATE, WM_DESTROY, WM_NCCREATE, WM_NOTIFY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_BORDER,
+        WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
     };
 
     const WM_WORKER: u32 = 0x8001;
@@ -492,7 +522,7 @@ where
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn hwnd(addr: isize) -> HWND {
+    fn as_hwnd(addr: isize) -> HWND {
         HWND(addr as *mut c_void)
     }
 
@@ -516,7 +546,7 @@ where
         (state.handler)(event, &gui);
     }
 
-    fn layout(state: &State<M>, width: i32, height: i32) {
+    fn layout<M>(state: &State<M>, width: i32, height: i32) {
         let h = state.handles;
         let content_x = NAV_WIDTH + GUTTER;
         let content_w = (width - content_x - GUTTER).max(0);
@@ -526,7 +556,7 @@ where
         // fit inside the client area for any width/height ≥ 0.
         unsafe {
             let _ = MoveWindow(
-                hwnd(h.nav),
+                as_hwnd(h.nav),
                 GUTTER,
                 GUTTER,
                 NAV_WIDTH,
@@ -535,7 +565,7 @@ where
             );
             let primary_w = BUTTON_W.min(content_w);
             let _ = MoveWindow(
-                hwnd(h.button),
+                as_hwnd(h.button),
                 content_x,
                 GUTTER,
                 primary_w,
@@ -543,18 +573,11 @@ where
                 true,
             );
             let sec_x = content_x + primary_w + BUTTON_GAP;
-            let sec_w = (content_w - primary_w - BUTTON_GAP).max(0).min(BUTTON_W);
+            let sec_w = (content_w - primary_w - BUTTON_GAP).clamp(0, BUTTON_W);
+            let _ = MoveWindow(as_hwnd(h.secondary), sec_x, GUTTER, sec_w, BUTTON_H, true);
+            let _ = MoveWindow(as_hwnd(h.list), content_x, list_y, content_w, list_h, true);
             let _ = MoveWindow(
-                hwnd(h.secondary),
-                sec_x,
-                GUTTER,
-                sec_w,
-                BUTTON_H,
-                true,
-            );
-            let _ = MoveWindow(hwnd(h.list), content_x, list_y, content_w, list_h, true);
-            let _ = MoveWindow(
-                hwnd(h.status),
+                as_hwnd(h.status),
                 content_x,
                 (height - STATUS_H - GUTTER).max(0),
                 content_w,
@@ -593,7 +616,7 @@ where
                 layout(state, state.spec.width, state.spec.height);
                 unsafe {
                     let _ = SendMessageW(
-                        hwnd(state.handles.nav),
+                        as_hwnd(state.handles.nav),
                         LB_SETCURSEL,
                         Some(WPARAM(0)),
                         Some(LPARAM(0)),
@@ -615,10 +638,10 @@ where
                     fire(state, GuiEvent::BackupClicked);
                 } else if id == ID_SECONDARY && notify == 0 {
                     fire(state, GuiEvent::SecondaryClicked);
-                } else if id == ID_NAV && notify as u32 == LBN_SELCHANGE as u32 {
+                } else if id == ID_NAV && notify as u32 == LBN_SELCHANGE {
                     let lres = unsafe {
                         SendMessageW(
-                            hwnd(state.handles.nav),
+                            as_hwnd(state.handles.nav),
                             LB_GETCURSEL,
                             None,
                             Some(LPARAM(0)),
@@ -648,14 +671,18 @@ where
                 // → padded to 24 bytes on 64-bit before iItem.
                 use windows::Win32::UI::Controls::LVN_ITEMACTIVATE;
                 #[repr(C)]
-                struct Nmhdr { hwnd: isize, id: usize, code: u32 }
-                if !lparam.0.is_null() {
-                    let hdr = unsafe { *(lparam.0 as *const Nmhdr) };
-                    if hdr.id == ID_LIST && hdr.code == NM_DBLCLK as u32 {
+                struct Nmhdr {
+                    hwnd: isize,
+                    id: usize,
+                    code: u32,
+                }
+                if lparam.0 != 0 {
+                    let hdr = unsafe { &*(lparam.0 as *const Nmhdr) };
+                    if hdr.id == ID_LIST && hdr.code == NM_DBLCLK {
                         // Read selected index via LVM_GETNEXTITEM.
                         let sel = unsafe {
                             SendMessageW(
-                                hwnd(state.handles.list),
+                                as_hwnd(state.handles.list),
                                 0x100B, // LVM_GETNEXTITEM
                                 Some(WPARAM((-1i32) as usize)),
                                 Some(LPARAM(2)), // LVNI_SELECTED
@@ -667,8 +694,12 @@ where
                         }
                     }
                     // LVN_ITEMACTIVATE is also generated by keyboard.
-                    if hdr.id == ID_LIST && hdr.code == LVN_ITEMACTIVATE as u32 {
-                        let offset = if std::mem::size_of::<usize>() == 8 { 24 } else { 12 };
+                    if hdr.id == ID_LIST && hdr.code == LVN_ITEMACTIVATE {
+                        let offset = if std::mem::size_of::<usize>() == 8 {
+                            24
+                        } else {
+                            12
+                        };
                         let item_ptr = (lparam.0 as *const u8).wrapping_add(offset) as *const i32;
                         let idx = unsafe { *item_ptr };
                         if idx >= 0 {
@@ -848,7 +879,7 @@ where
     }
 
     let queue: Arc<Mutex<VecDeque<M>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let columns: ColumnCount = Arc::new(Cell::new(spec.columns.len()));
+    let columns: ColumnCount = Rc::new(Cell::new(spec.columns.len()));
     let state = Box::new(State {
         handler: Box::new(handler),
         queue,
@@ -913,17 +944,17 @@ where
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
 
-            let mut msg = MSG::default();
-            loop {
-                let r = GetMessageW(&mut msg, None, 0, 0);
-                // GetMessageW returns BOOL(0) on WM_QUIT and BOOL(-1) on error.
-                let val = r.0 as i32;
-                if val == 0 || val == -1 {
-                    break;
-                }
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+        let mut msg = MSG::default();
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0);
+            // GetMessageW returns BOOL(0) on WM_QUIT and BOOL(-1) on error.
+            let val = r.0 as i32;
+            if val == 0 || val == -1 {
+                break;
             }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
     Ok(())
 }
