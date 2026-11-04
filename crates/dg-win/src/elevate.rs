@@ -64,35 +64,42 @@ pub fn helper_main(args: &[String]) -> u8 {
     // Two forms:
     //   driverguard --elevated export-drivers <abs-folder>          (v0.1 argv)
     //   driverguard --elevated --request <path-to-json-request>     (v0.2 JSON)
-    let (request, response_path): (crate::helper::HelperRequest, Option<&Path>) =
-        if let Some(dash_dash) = args.iter().position(|a| a == "--request" || a == "-request") {
-            let Some(path) = args.get(dash_dash + 1) else {
-                eprintln!("driverguard --elevated --request: missing path");
-                return EXIT_USAGE;
-            };
-            let path = Path::new(path);
-            match crate::helper::read_request(path) {
-                Ok(req) => (req, Some(path)),
-                Err(e) => {
-                    eprintln!("driverguard --elevated: invalid request at {}: {e}", path.display());
-                    return EXIT_USAGE;
-                }
-            }
-        } else {
-            match parse_legacy_args(args) {
-                Ok(LegacyRequest::ExportDrivers(dest)) => (
-                    crate::helper::HelperRequest {
-                        op: crate::helper::HelperOp::ExportDrivers { dest },
-                    },
-                    None,
-                ),
-                Err(e) => {
-                    eprintln!("driverguard --elevated: {e}");
-                    eprintln!("usage: driverguard --elevated [{OP_EXPORT_DRIVERS} <folder> | --request <file>]");
-                    return EXIT_USAGE;
-                }
-            }
+    let (request, response_path): (crate::helper::HelperRequest, Option<&Path>) = if let Some(
+        dash_dash,
+    ) = args
+        .iter()
+        .position(|a| a == "--request" || a == "-request")
+    {
+        let Some(path) = args.get(dash_dash + 1) else {
+            eprintln!("driverguard --elevated --request: missing path");
+            return EXIT_USAGE;
         };
+        let path = Path::new(path);
+        match crate::helper::read_request(path) {
+            Ok(req) => (req, Some(path)),
+            Err(e) => {
+                eprintln!(
+                    "driverguard --elevated: invalid request at {}: {e}",
+                    path.display()
+                );
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        match parse_legacy_args(args) {
+            Ok(LegacyRequest::ExportDrivers(dest)) => (
+                crate::helper::HelperRequest {
+                    op: crate::helper::HelperOp::ExportDrivers { dest },
+                },
+                None,
+            ),
+            Err(e) => {
+                eprintln!("driverguard --elevated: {e}");
+                eprintln!("usage: driverguard --elevated [{OP_EXPORT_DRIVERS} <folder> | --request <file>]");
+                return EXIT_USAGE;
+            }
+        }
+    };
 
     match is_elevated() {
         Ok(true) => {}
@@ -100,10 +107,7 @@ pub fn helper_main(args: &[String]) -> u8 {
             eprintln!("driverguard --elevated: this helper must run elevated; refusing.");
             try_write_response(
                 response_path,
-                &crate::helper::HelperResponse::err(
-                    "helper launched without elevation",
-                    None,
-                ),
+                &crate::helper::HelperResponse::err("helper launched without elevation", None),
             );
             return EXIT_FAILED;
         }
@@ -126,7 +130,11 @@ pub fn helper_main(args: &[String]) -> u8 {
             crate::helper::HelperResponse::Err { message, .. } => eprintln!("{message}"),
         }
     }
-    if ok { EXIT_OK } else { EXIT_FAILED }
+    if ok {
+        EXIT_OK
+    } else {
+        EXIT_FAILED
+    }
 }
 
 fn try_write_response(path: Option<&Path>, resp: &crate::helper::HelperResponse) {
@@ -155,14 +163,21 @@ fn execute(op: &crate::helper::HelperOp) -> crate::helper::HelperResponse {
             let mut rp_message: Option<String> = None;
             if plan.create_restore_point {
                 match crate::system::create_restore_point(&plan.description) {
-                    Ok(()) => { rp_message = Some("system restore point created".to_owned()); }
-                    Err(e) => { rp_message = Some(format!("restore point not created: {e}")); }
+                    Ok(()) => {
+                        rp_message = Some("system restore point created".to_owned());
+                    }
+                    Err(e) => {
+                        rp_message = Some(format!("restore point not created: {e}"));
+                    }
                 }
             }
             match crate::policy::apply_plan(plan) {
                 Ok(()) => {
                     let mut msg = "policy applied".to_owned();
-                    if let Some(m) = rp_message { msg.push_str("; "); msg.push_str(&m); }
+                    if let Some(m) = rp_message {
+                        msg.push_str("; ");
+                        msg.push_str(&m);
+                    }
                     HelperResponse::ok(msg)
                 }
                 Err(e) => HelperResponse::err(e.to_string(), None),
@@ -192,7 +207,9 @@ pub fn is_elevated() -> Result<bool> {
 /// Run an elevated helper for a generic HelperRequest, writing the
 /// request to a temp file, launching `--elevated --request <path>`
 /// through UAC, waiting for exit, and returning the response.
-pub fn run_elevated(request: &crate::helper::HelperRequest) -> Result<crate::helper::HelperResponse> {
+pub fn run_elevated(
+    request: &crate::helper::HelperRequest,
+) -> Result<crate::helper::HelperResponse> {
     #[cfg(target_os = "windows")]
     {
         platform::run_elevated(request)
@@ -209,14 +226,17 @@ pub fn run_elevated(request: &crate::helper::HelperRequest) -> Result<crate::hel
 /// an ExportDrivers op.
 pub fn run_export_helper(dest: &Path) -> Result<()> {
     let req = crate::helper::HelperRequest {
-        op: crate::helper::HelperOp::ExportDrivers { dest: dest.to_path_buf() },
+        op: crate::helper::HelperOp::ExportDrivers {
+            dest: dest.to_path_buf(),
+        },
     };
     let resp = run_elevated(&req)?;
     match resp {
         crate::helper::HelperResponse::Ok { .. } => Ok(()),
-        crate::helper::HelperResponse::Err { message, code } => {
-            Err(WinError::Api { code: code.unwrap_or(1), message })
-        }
+        crate::helper::HelperResponse::Err { message, code } => Err(WinError::Api {
+            code: code.unwrap_or(1),
+            message,
+        }),
     }
 }
 
@@ -230,23 +250,27 @@ pub fn run_apply_lock(plan: &dg_core::LockPlan) -> Result<String> {
     let resp = run_elevated(&req)?;
     match resp {
         crate::helper::HelperResponse::Ok { message } => Ok(message),
-        crate::helper::HelperResponse::Err { message, code } => {
-            Err(WinError::Api { code: code.unwrap_or(1), message })
-        }
+        crate::helper::HelperResponse::Err { message, code } => Err(WinError::Api {
+            code: code.unwrap_or(1),
+            message,
+        }),
     }
 }
 
 /// Create a system restore point via the elevated helper.
 pub fn run_create_restore_point(description: &str) -> Result<String> {
     let req = crate::helper::HelperRequest {
-        op: crate::helper::HelperOp::CreateRestorePoint { description: description.to_owned() },
+        op: crate::helper::HelperOp::CreateRestorePoint {
+            description: description.to_owned(),
+        },
     };
     let resp = run_elevated(&req)?;
     match resp {
         crate::helper::HelperResponse::Ok { message } => Ok(message),
-        crate::helper::HelperResponse::Err { message, code } => {
-            Err(WinError::Api { code: code.unwrap_or(1), message })
-        }
+        crate::helper::HelperResponse::Err { message, code } => Err(WinError::Api {
+            code: code.unwrap_or(1),
+            message,
+        }),
     }
 }
 
@@ -260,7 +284,10 @@ mod platform {
     }
 
     fn api(e: windows::core::Error) -> WinError {
-        WinError::Api { code: e.code().0 as u32, message: e.to_string() }
+        WinError::Api {
+            code: e.code().0 as u32,
+            message: e.to_string(),
+        }
     }
 
     pub fn is_elevated() -> Result<bool> {
@@ -287,7 +314,9 @@ mod platform {
         }
     }
 
-    pub fn run_elevated(request: &crate::helper::HelperRequest) -> Result<crate::helper::HelperResponse> {
+    pub fn run_elevated(
+        request: &crate::helper::HelperRequest,
+    ) -> Result<crate::helper::HelperResponse> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::CloseHandle;
         use windows::Win32::System::Threading::{
@@ -306,10 +335,7 @@ mod platform {
             tool: "driverguard".to_owned(),
             detail: format!("could not locate the running program: {e}"),
         })?;
-        let params = format!(
-            "--elevated --request \"{}\"",
-            path.display()
-        );
+        let params = format!("--elevated --request \"{}\"", path.display());
         let verb = wide(std::ffi::OsStr::new("runas"));
         let file_w = wide(exe.as_os_str());
         let params_w = wide(std::ffi::OsStr::new(&params));
@@ -349,6 +375,8 @@ mod platform {
 
     struct CleanupPath(std::path::PathBuf);
     impl Drop for CleanupPath {
-        fn drop(&mut self) { crate::helper::cleanup_request(&self.0); }
+        fn drop(&mut self) {
+            crate::helper::cleanup_request(&self.0);
+        }
     }
 }

@@ -8,9 +8,10 @@
 
 #![forbid(unsafe_code)]
 
-use dg_core::{DeviceSnapshot, DriverSource, LockRecord, Snapshot};
+use dg_core::{DeviceSnapshot, DriverSource, Snapshot};
 use dg_win::backup::MANIFEST_FILE;
-use dg_win::gui::{Gui, GuiEvent, GuiHandle, MsgButtons, MsgIcon, MsgResult, WindowSpec};
+use dg_win::gui::{Gui, GuiEvent, GuiHandle, WindowSpec};
+#[cfg(test)]
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -18,8 +19,9 @@ use std::path::PathBuf;
 pub const VIEW_NAMES: [&str; 4] = ["Devices", "Backups", "History", "Settings"];
 
 /// Index of the view currently selected in the left nav.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum View {
+    #[default]
     Devices = 0,
     Backups = 1,
     History = 2,
@@ -60,10 +62,7 @@ fn columns_for(view: View) -> Vec<(String, i32)> {
             ("Event".to_owned(), 140),
             ("Summary".to_owned(), 440),
         ],
-        View::Settings => vec![
-            ("Setting".to_owned(), 200),
-            ("Value".to_owned(), 520),
-        ],
+        View::Settings => vec![("Setting".to_owned(), 200), ("Value".to_owned(), 520)],
     }
 }
 
@@ -87,9 +86,15 @@ enum Msg {
     /// A lock or unlock action completed on the worker thread; bool is
     /// true for locked, false for unlocked. String is a human-readable
     /// status message for the status line.
-    LockFinished { locked: bool, message: String },
+    LockFinished {
+        locked: bool,
+        message: String,
+    },
     /// The watch-task toggle completed; bool is true for registered.
-    WatchToggled { registered: bool, message: String },
+    WatchToggled {
+        registered: bool,
+        message: String,
+    },
 }
 
 /// A completed backup, as reported to the status line.
@@ -101,8 +106,9 @@ struct BackupDone {
 /// Which Settings secondary action is currently visible, so a click on
 /// the secondary button can be dispatched. The button is hidden in
 /// views that don't need a second action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SecondaryAction {
+    #[default]
     None,
     ToggleWatch,
 }
@@ -192,21 +198,27 @@ impl App {
             "Per-device deny list".to_owned(),
             format!(
                 "{} ({} entries)",
-                if policy.deny_enabled { "enabled" } else { "disabled" },
+                if policy.deny_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
                 policy.denied_hardware_ids.len()
             ),
         ]);
         rows.push(vec![
             "Exclude drivers from Windows Quality Updates".to_owned(),
-            if policy.wu_exclude_drivers { "on" } else { "off" }.to_owned(),
+            if policy.wu_exclude_drivers {
+                "on"
+            } else {
+                "off"
+            }
+            .to_owned(),
         ]);
         let locks = dg_win::store::Store::open_default()
             .and_then(|s| s.list_locks())
             .unwrap_or_default();
-        rows.push(vec![
-            "Active locks".to_owned(),
-            format!("{}", locks.len()),
-        ]);
+        rows.push(vec!["Active locks".to_owned(), format!("{}", locks.len())]);
         let watch_on = dg_win::system::is_watch_task_registered().unwrap_or(false);
         rows.push(vec![
             "Watcher scheduled task".to_owned(),
@@ -244,13 +256,13 @@ impl App {
                     self.switch_view(new_view, gui);
                 }
             }
-            GuiEvent::SecondaryClicked => match (self.view, self.secondary) {
-                (View::Settings, SecondaryAction::ToggleWatch) => {
+            GuiEvent::SecondaryClicked => {
+                if let (View::Settings, SecondaryAction::ToggleWatch) = (self.view, self.secondary)
+                {
                     gui.set_status("Updating watch task…");
                     spawn_watch_toggle(gui.handle());
                 }
-                _ => {}
-            },
+            }
             GuiEvent::BackupClicked => match self.view {
                 View::Devices => {
                     if self.backup_running {
@@ -298,10 +310,8 @@ impl App {
                     .into_iter()
                     .map(|lr| lr.hardware_id.to_ascii_lowercase())
                     .collect::<std::collections::HashSet<String>>();
-                let rows: Vec<Vec<String>> = devices
-                    .iter()
-                    .map(|d| row_for(d, &lock_set))
-                    .collect();
+                let rows: Vec<Vec<String>> =
+                    devices.iter().map(|d| row_for(d, &lock_set)).collect();
                 if self.view == View::Devices {
                     gui.set_rows(&rows);
                 }
@@ -316,14 +326,14 @@ impl App {
                         })
                     })
                     .count();
-                self.last_devices = Some(devices);
-                self.last_device_count = Some(self.last_devices.as_ref().map(|v| v.len()).unwrap_or(0));
+                self.last_device_count = Some(devices.len());
                 self.last_microsoft_count = Some(microsoft);
                 gui.set_status(&format!(
                     "{} devices · {} using a Microsoft driver",
                     devices.len(),
                     microsoft
                 ));
+                self.last_devices = Some(devices);
             }
             GuiEvent::Worker(Msg::InventoryLoaded(Err(e))) => {
                 gui.set_status(&format!("Could not list devices: {e}"));
@@ -395,7 +405,10 @@ impl App {
                 }
                 let _ = locked; // reserved for future icon state
             }
-            GuiEvent::Worker(Msg::WatchToggled { registered, message }) => {
+            GuiEvent::Worker(Msg::WatchToggled {
+                registered,
+                message,
+            }) => {
                 gui.set_status(&message);
                 let _ = registered;
                 if self.view == View::Settings {
@@ -410,7 +423,9 @@ impl App {
     fn on_row_activated(&mut self, idx: usize, gui: &Gui<Msg>) {
         match self.view {
             View::Devices => {
-                let Some(devices) = self.last_devices.as_ref() else { return };
+                let Some(devices) = self.last_devices.as_ref() else {
+                    return;
+                };
                 let Some(ds) = devices.get(idx) else { return };
                 self.prompt_lock_toggle(ds, gui);
             }
@@ -508,7 +523,12 @@ fn row_for(ds: &DeviceSnapshot, lock_set: &std::collections::HashSet<String>) ->
 }
 
 /// Run a lock or unlock on a worker thread and post the result.
-fn spawn_lock_toggle(handle: GuiHandle<Msg>, hardware_id: String, device_name: String, unlock: bool) {
+fn spawn_lock_toggle(
+    handle: GuiHandle<Msg>,
+    hardware_id: String,
+    device_name: String,
+    unlock: bool,
+) {
     std::thread::spawn(move || {
         let (locked, message) = run_lock_toggle(&hardware_id, &device_name, unlock);
         handle.post(Msg::LockFinished { locked, message });
@@ -600,7 +620,8 @@ fn spawn_watch_toggle(handle: GuiHandle<Msg>) {
                 },
             }
         } else {
-            match dg_win::system::current_exe_path().and_then(|p| dg_win::system::register_watch_task(&p))
+            match dg_win::system::current_exe_path()
+                .and_then(|p| dg_win::system::register_watch_task(&p))
             {
                 Ok(()) => Msg::WatchToggled {
                     registered: true,
@@ -632,10 +653,7 @@ fn spawn_inventory(handle: GuiHandle<Msg>) {
                     let _ = store.record_event(
                         dg_core::EventKind::Inventory,
                         &dg_win::now_iso8601_utc(),
-                        &format!(
-                            "Recorded {} devices (snapshot #{snap_id})",
-                            devices.len()
-                        ),
+                        &format!("Recorded {} devices (snapshot #{snap_id})", devices.len()),
                         None,
                     );
                 }
@@ -785,7 +803,10 @@ mod tests {
     fn row_for_driverless_device() {
         let locks = HashSet::new();
         let row = row_for(&device(None), &locks);
-        assert_eq!(row, vec!["Test GPU", "Display", "—", "—", "—", "No driver", ""]);
+        assert_eq!(
+            row,
+            vec!["Test GPU", "Display", "—", "—", "—", "No driver", ""]
+        );
     }
 
     #[test]
